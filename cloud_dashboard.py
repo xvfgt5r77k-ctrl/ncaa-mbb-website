@@ -1010,12 +1010,152 @@ def feature_analysis_coverage(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+# Matchup Explorer is retrospective and descriptive. Season ratings and AP poll
+# positions are end-of-season for archived years; never represent them as ratings
+# known before a historical game or as forecasts for a future matchup.
+ADVANCED_MATCHUP_RATINGS_SQL = """
+SELECT r.team_id, t.name AS team, COALESCE(t.conference, '—') AS conference,
+       t.logo_url, r.games_played AS gp,
+       r.adjusted_offense AS adj_off, r.adjusted_defense AS adj_def,
+       r.adjusted_net AS adj_net, r.opponent_sos AS opp_sos
+FROM team_adjusted_ratings r
+JOIN teams t ON t.team_id=r.team_id
+WHERE r.season=%s AND t.is_d1=1
+ORDER BY r.adjusted_net DESC, t.name ASC
+"""
+
+# Both team box scores must exist for a game to enter scoring/tempo trends.
+# Only the selected teams' actual finished games are read, never future games.
+ADVANCED_MATCHUP_GAMES_SQL = """
+SELECT g.game_id, g.game_date, g.start_time_utc,
+       s.team_id, o.team_id AS opponent_id,
+       ot.name AS opponent_name, g.home_team_id, g.away_team_id,
+       g.neutral_site, s.points, o.points AS opponent_points,
+       s.possessions
+FROM games g
+JOIN team_game_stats s ON s.game_id=g.game_id
+JOIN team_game_stats o ON o.game_id=g.game_id AND o.team_id<>s.team_id
+JOIN teams ot ON ot.team_id=o.team_id
+WHERE g.season=%s AND g.completed=1
+  AND s.team_id IN (%s,%s)
+  AND s.points IS NOT NULL AND o.points IS NOT NULL
+  AND s.possessions>0 AND o.possessions>0
+ORDER BY g.game_date,g.game_id,s.team_id
+"""
+
+
+def advanced_matchup_history(rows: pd.DataFrame, team_id: str) -> pd.DataFrame:
+    """Chronological usable box scores for exactly one team; no upcoming games."""
+    cols = ("game_id", "game_date", "team_id", "opponent_id", "opponent_name",
+            "home_team_id", "neutral_site", "points", "opponent_points", "possessions")
+    if rows.empty:
+        return pd.DataFrame(columns=[*cols, "venue", "margin", "result", "full_rest_days"])
+    data = rows.loc[rows["team_id"].astype(str) == str(team_id)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=[*cols, "venue", "margin", "result", "full_rest_days"])
+    for col in ("points", "opponent_points", "possessions"):
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    data["game_date"] = pd.to_datetime(data["game_date"], errors="coerce")
+    data = data.dropna(subset=["game_date", "points", "opponent_points", "possessions"])
+    data = data[(data["points"] >= 0) & (data["opponent_points"] >= 0)
+                & (data["possessions"] > 0)].copy()
+    data = data.drop_duplicates(subset=["game_id", "team_id"])
+    data = data.sort_values(["game_date", "game_id"], kind="stable").reset_index(drop=True)
+    if data.empty:
+        return data
+    neutral = pd.to_numeric(data["neutral_site"], errors="coerce").fillna(0).eq(1)
+    home = data["home_team_id"].astype(str).eq(str(team_id))
+    data["venue"] = "Away"
+    data.loc[home, "venue"] = "Home"
+    data.loc[neutral, "venue"] = "Neutral"
+    data["margin"] = data["points"] - data["opponent_points"]
+    data["result"] = data["margin"].apply(lambda diff: "W" if diff > 0 else "L" if diff < 0 else "T")
+    data["full_rest_days"] = (data["game_date"].diff().dt.days - 1).clip(lower=0)
+    return data
+
+
+def advanced_matchup_summary(history: pd.DataFrame, recent_n: int = 5) -> dict:
+    """Summarize completed team games; no forecast or opponent-adjusted inference."""
+    if recent_n < 1:
+        raise ValueError("recent_n must be positive")
+    if history.empty:
+        return {"games": 0, "ppg": None, "allowed": None, "pace": None,
+                "margin": None, "recent_ppg": None, "recent_allowed": None,
+                "recent_margin": None, "recent_wins": 0, "recent_losses": 0,
+                "recent_games": 0, "avg_rest": None, "last_date": None}
+    recent = history.tail(recent_n)
+    rest = pd.to_numeric(history["full_rest_days"], errors="coerce")
+    return {
+        "games": len(history),
+        "ppg": float(history["points"].mean()),
+        "allowed": float(history["opponent_points"].mean()),
+        "pace": float(history["possessions"].mean()),
+        "margin": float(history["margin"].mean()),
+        "recent_ppg": float(recent["points"].mean()),
+        "recent_allowed": float(recent["opponent_points"].mean()),
+        "recent_margin": float(recent["margin"].mean()),
+        "recent_wins": int(recent["result"].eq("W").sum()),
+        "recent_losses": int(recent["result"].eq("L").sum()),
+        "recent_games": len(recent),
+        "avg_rest": float(rest.mean()) if rest.notna().any() else None,
+        "last_date": history["game_date"].iloc[-1],
+    }
+
+
+def advanced_matchup_comparison_table(left: pd.Series, right: pd.Series,
+                                      left_sum: dict, right_sum: dict,
+                                      left_record: str, right_record: str) -> pd.DataFrame:
+    """Display matching season summary metrics without claiming a winning team."""
+    metric_fields = [
+        ("Overall W–L (all completed games)", left_record, right_record, False),
+        ("Games with usable box scores", left_sum["games"], right_sum["games"], False),
+        ("Adjusted efficiency national rank", left["national_rank"], right["national_rank"], False),
+        ("Adjusted offense / 100 possessions", left["adj_off"], right["adj_off"], True),
+        ("Adjusted defense / 100 possessions", left["adj_def"], right["adj_def"], True),
+        ("Adjusted net / 100 possessions", left["adj_net"], right["adj_net"], True),
+        ("Opponent strength of schedule", left["opp_sos"], right["opp_sos"], True),
+        ("Points scored per game", left_sum["ppg"], right_sum["ppg"], True),
+        ("Points allowed per game", left_sum["allowed"], right_sum["allowed"], True),
+        ("Possessions per game (estimated)", left_sum["pace"], right_sum["pace"], True),
+        ("Average scoring margin", left_sum["margin"], right_sum["margin"], True),
+        ("Recent points per game", left_sum["recent_ppg"], right_sum["recent_ppg"], True),
+        ("Recent points allowed per game", left_sum["recent_allowed"], right_sum["recent_allowed"], True),
+        ("Recent average scoring margin", left_sum["recent_margin"], right_sum["recent_margin"], True),
+        ("Recent W–L (usable games)",
+         f'{left_sum["recent_wins"]}–{left_sum["recent_losses"]}',
+         f'{right_sum["recent_wins"]}–{right_sum["recent_losses"]}', False),
+        ("Avg full days off between games", left_sum["avg_rest"], right_sum["avg_rest"], True),
+    ]
+    def show(value, numeric):
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{float(value):.1f}" if numeric else str(value)
+    return pd.DataFrame([{"Statistic": label,
+                          "Team A": show(a, rounded), "Team B": show(b, rounded)}
+                         for label, a, b, rounded in metric_fields])
+
+
+def advanced_matchup_recent_table(history: pd.DataFrame, n: int) -> pd.DataFrame:
+    """Render a team's latest completed games, never upcoming schedule rows."""
+    if history.empty:
+        return pd.DataFrame(columns=["Date", "Opponent", "Venue", "Result", "Score", "Possessions"])
+    recent = history.tail(n).iloc[::-1]
+    return pd.DataFrame({
+        "Date": recent["game_date"].dt.strftime("%Y-%m-%d").to_numpy(),
+        "Opponent": recent["opponent_name"].to_numpy(),
+        "Venue": recent["venue"].to_numpy(),
+        "Result": recent["result"].to_numpy(),
+        "Score": [f"{int(p)}–{int(o)}" for p, o in zip(recent["points"], recent["opponent_points"])],
+        "Possessions": recent["possessions"].round(1).to_numpy(),
+    }).reset_index(drop=True)
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Advanced Matchup Comparison", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -2248,6 +2388,113 @@ elif page == "Statistical Feature Analysis":
     st.caption("Data source: your existing Supabase pregame_team_features and completed "
                "ESPN games/box scores. This page reads data only. It does not modify "
                "Supabase or produce upcoming-matchup forecasts, picks, or wagering outputs.")
+
+
+elif page == "Advanced Matchup Comparison":
+    st.subheader("Advanced Matchup Comparison")
+    st.caption("Compare two Division I teams from the selected season using imported, "
+               "completed games. Ratings for past seasons describe the whole season, "
+               "NOT what was known before a historical game. This page does not "
+               "estimate outcomes of future games.")
+    tables = query("SELECT to_regclass('public.team_adjusted_ratings') IS NOT NULL AS available")
+    if tables.empty or not bool(tables.iloc[0]["available"]):
+        st.info("Run 'Update NCAA MBB Adjusted SOS and History' in GitHub Actions first.")
+    else:
+        rated = historical_rankings(query(ADVANCED_MATCHUP_RATINGS_SQL, (season,)))
+        if len(rated) < 2:
+            st.info("At least two rated D1 teams are required. Refresh the season's "
+                    "adjusted ratings in GitHub Actions.")
+        else:
+            ap_for_matchup, poll_source = comparison_ap_poll(season, latest_season)
+            st.caption(f"Basketball season: {historical_season_label(season)}. "
+                       f"AP poll: {poll_source or 'unavailable'}; historical AP ranks "
+                       "are from the selected season's latest available regular-season poll, "
+                       "not the date of a specific game.")
+            labels = {str(r["team_id"]): comparison_team_name(
+                          r["team"], r["conference"], r["team_id"],
+                          ap_for_matchup, bool(ap_for_matchup))
+                      for _, r in rated.iterrows()}
+            team_ids = list(labels)
+            a_selector, b_selector = st.columns(2)
+            with a_selector:
+                a_id = st.selectbox("Team A", team_ids, index=0,
+                                    format_func=lambda x: labels[x],
+                                    key="advanced_matchup_a")
+            with b_selector:
+                b_id = st.selectbox("Team B", team_ids, index=1,
+                                    format_func=lambda x: labels[x],
+                                    key="advanced_matchup_b")
+            if a_id == b_id:
+                st.info("Choose two different teams to see a comparison.")
+            else:
+                a = rated.loc[rated["team_id"].astype(str).eq(a_id)].iloc[0]
+                b = rated.loc[rated["team_id"].astype(str).eq(b_id)].iloc[0]
+                records = season_records(season)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown('<div class="mbb-team-card">' + team_badge(
+                        a["team"], a_id, a["logo_url"], ap_for_matchup, records) +
+                        '</div>', unsafe_allow_html=True)
+                    st.metric("Adjusted net / 100 possessions",
+                              historical_number(a["adj_net"], signed=True))
+                    st.caption(f"Adjusted efficiency rank #{int(a['national_rank'])}")
+                with c2:
+                    st.markdown('<div class="mbb-team-card">' + team_badge(
+                        b["team"], b_id, b["logo_url"], ap_for_matchup, records) +
+                        '</div>', unsafe_allow_html=True)
+                    st.metric("Adjusted net / 100 possessions",
+                              historical_number(b["adj_net"], signed=True))
+                    st.caption(f"Adjusted efficiency rank #{int(b['national_rank'])}")
+                recent_n = st.select_slider("Recent completed games to compare",
+                                            options=[3, 5, 10], value=5,
+                                            key="advanced_matchup_recent_n")
+                boxscores = query(ADVANCED_MATCHUP_GAMES_SQL, (season, a_id, b_id))
+                a_games = advanced_matchup_history(boxscores, a_id)
+                b_games = advanced_matchup_history(boxscores, b_id)
+                a_sum = advanced_matchup_summary(a_games, recent_n)
+                b_sum = advanced_matchup_summary(b_games, recent_n)
+                stats_tab, games_tab, head_to_head_tab = st.tabs([
+                    "📊 Side-by-side stats", "🗓️ Recent game history", "🤝 Head-to-head"
+                ])
+                with stats_tab:
+                    st.markdown("#### Team performance and schedule quality")
+                    st.caption("'Team A' and 'Team B' follow the selectors above. "
+                               "Adjusted metrics and SOS come from season-to-date "
+                               "ratings; scoring and tempo use games with complete "
+                               "ESPN team box scores. The full-season numbers for "
+                               "archived seasons include all completed games of that year.")
+                    comparison = advanced_matchup_comparison_table(
+                        a, b, a_sum, b_sum, record_label(a_id, records),
+                        record_label(b_id, records))
+                    show_table(comparison)
+                    st.download_button("Download matchup statistics (CSV)",
+                                       comparison.to_csv(index=False),
+                                       f"ncaa_matchup_{season}_{a_id}_{b_id}.csv", "text/csv",
+                                       key="advanced_matchup_download")
+                    st.caption("A lower adjusted defensive efficiency is better. "
+                               "SOS is a measure of prior opponent quality, not a "
+                               "guarantee of better results. Missing values are —.")
+                with games_tab:
+                    left_games, right_games = st.columns(2)
+                    with left_games:
+                        st.markdown(f"#### {a['team']} — last {recent_n}")
+                        show_table(advanced_matchup_recent_table(a_games, recent_n))
+                    with right_games:
+                        st.markdown(f"#### {b['team']} — last {recent_n}")
+                        show_table(advanced_matchup_recent_table(b_games, recent_n))
+                    st.caption("W/L and scores are from each selected team's perspective. "
+                               "Only finished games with both teams' box scores appear; "
+                               "canceled and postponed games are excluded.")
+                with head_to_head_tab:
+                    st.markdown("#### Direct meetings during the selected season")
+                    meetings = a_games.loc[a_games["opponent_id"].astype(str).eq(b_id)]
+                    if meetings.empty:
+                        st.info("No completed meeting with usable box scores was "
+                                "found for these teams in this season.")
+                    else:
+                        show_table(advanced_matchup_recent_table(meetings, len(meetings)))
+                    st.caption("This is a record of games already played, "
+                               "not a prediction for a future matchup.")
 
 elif page == "Injuries":
     st.subheader("Official conference player availability")
