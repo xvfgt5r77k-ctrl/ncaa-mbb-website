@@ -1782,12 +1782,408 @@ def historical_drift_venue_mix(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+# Historical Data Readiness: consolidated read-only historical DATA quality checks.
+# Pass/Review statuses describe data-audit heuristics, not forecasting accuracy,
+# model deployment readiness, or guarantees about new matchups.
+READINESS_COVERAGE_SQL = """
+SELECT season, all_game_records, completed_games, not_completed_games,
+       d1_matchups, complete_scores, both_box_scores, usable_stat_games,
+       score_mismatches, incomplete_possessions, missing_start_time
+FROM historical_coverage_audit
+WHERE season BETWEEN %s AND %s
+ORDER BY season
+"""
+
+READINESS_FEATURES_SQL = """
+SELECT season,
+       COUNT(*) AS pregame_rows,
+       COUNT(*) FILTER (WHERE games_before >= 5) AS rows_with_5_games,
+       COUNT(*) FILTER (
+           WHERE games_before >= 5 AND adjusted_net_before IS NOT NULL
+             AND rating_snapshot_date IS NOT NULL
+             AND rating_snapshot_date::text < game_date::text
+       ) AS rows_with_prior_adjusted,
+       COUNT(*) FILTER (
+           WHERE rating_snapshot_date IS NOT NULL
+             AND rating_snapshot_date::text >= game_date::text
+       ) AS nonprior_snapshot_dates,
+       COUNT(*) FILTER (
+           WHERE (adjusted_net_before IS NOT NULL OR opponent_sos_before IS NOT NULL)
+             AND (rating_snapshot_date IS NULL OR
+                  rating_snapshot_date::text >= game_date::text)
+       ) AS unsafe_rating_values
+FROM pregame_team_features
+WHERE season BETWEEN %s AND %s
+GROUP BY season ORDER BY season
+"""
+
+READINESS_ACCURACY_SQL = """
+SELECT season, split_name, eligible_d1_games, evaluated_games,
+       evaluated_team_scores, points_mae, points_rmse, points_bias
+FROM historical_score_baseline_audit
+WHERE season BETWEEN %s AND %s
+ORDER BY season
+"""
+
+READINESS_METRICS = (
+    "Prior points per game", "Prior adjusted net efficiency",
+    "Prior strength of schedule", "Prior possessions per game",
+    "Recent five-game scoring margin",
+)
+
+
+def readiness_coverage_display(coverage: pd.DataFrame) -> pd.DataFrame:
+    """D1 vs D1 is the denominator; don't treat postponed games as missing data."""
+    cols = ["Season", "D1 completed matchups", "Usable games", "Usable %",
+            "Missing box-score pairs", "Score mismatches", "Invalid possessions"]
+    if coverage.empty:
+        return pd.DataFrame(columns=cols)
+    data = coverage.copy()
+    for col in ("d1_matchups", "usable_stat_games", "both_box_scores",
+                "score_mismatches", "incomplete_possessions"):
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+    d1 = data["d1_matchups"]
+    data["usable_percent"] = np.where(d1.gt(0),
+        100 * data["usable_stat_games"] / d1.replace(0, np.nan), np.nan)
+    return pd.DataFrame({
+        "Season": data["season"].astype(int).map(historical_season_label),
+        "D1 completed matchups": data["d1_matchups"].astype(int),
+        "Usable games": data["usable_stat_games"].astype(int),
+        "Usable %": data["usable_percent"].round(1),
+        "Missing box-score pairs": (data["d1_matchups"] - data["both_box_scores"]).clip(lower=0).astype(int),
+        "Score mismatches": data["score_mismatches"].astype(int),
+        "Invalid possessions": data["incomplete_possessions"].astype(int),
+    }, columns=cols)
+
+
+def readiness_feature_display(features: pd.DataFrame) -> pd.DataFrame:
+    """Prior adjusted rating coverage is conditional on having five prior games."""
+    columns = ["Season", "Pregame rows", "Rows with 5+ prior games",
+               "Prior adj. rating %", "Non-prior snapshot dates", "Unsafe rating values"]
+    if features.empty:
+        return pd.DataFrame(columns=columns)
+    data = features.copy()
+    for col in ("pregame_rows", "rows_with_5_games", "rows_with_prior_adjusted",
+                "nonprior_snapshot_dates", "unsafe_rating_values"):
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+    eligible = data["rows_with_5_games"]
+    fraction = 100 * data["rows_with_prior_adjusted"] / eligible.replace(0, np.nan)
+    return pd.DataFrame({
+        "Season": data["season"].astype(int).map(historical_season_label),
+        "Pregame rows": data["pregame_rows"].astype(int),
+        "Rows with 5+ prior games": eligible.astype(int),
+        "Prior adj. rating %": fraction.round(1),
+        "Non-prior snapshot dates": data["nonprior_snapshot_dates"].astype(int),
+        "Unsafe rating values": data["unsafe_rating_values"].astype(int),
+    }, columns=columns)
+
+
+def readiness_drift_display(data: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive distribution shift; >0.5 development SD is a REVIEW heuristic."""
+    columns = ["Prior-game metric", "Validation shift (SD)",
+               "Holdout shift (SD)", "Largest |shift| (SD)", "Review"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    result = []
+    for metric in READINESS_METRICS:
+        summary = historical_drift_summary(data, metric)
+        if summary.empty:
+            continue
+        rows = summary.set_index("Period")
+        val = pd.to_numeric(pd.Series([
+            rows.loc["Validation (2024–25)", "Difference / development SD"]
+        ]), errors="coerce").iloc[0]
+        test = pd.to_numeric(pd.Series([
+            rows.loc["Holdout (2025–26)", "Difference / development SD"]
+        ]), errors="coerce").iloc[0]
+        available = [abs(float(x)) for x in (val, test) if pd.notna(x)]
+        maximum = max(available) if available else float("nan")
+        result.append({"Prior-game metric": metric,
+                       "Validation shift (SD)": float(val),
+                       "Holdout shift (SD)": float(test),
+                       "Largest |shift| (SD)": round(maximum, 3) if available else float("nan"),
+                       "Review": "Review" if available and maximum >= .5 else
+                                 "Within heuristic" if len(available) == 2 else "Unavailable"})
+    return pd.DataFrame(result, columns=columns)
+
+
+def readiness_checklist(coverage: pd.DataFrame, features: pd.DataFrame,
+                        accuracy: pd.DataFrame, drift: pd.DataFrame) -> pd.DataFrame:
+    """Evidence-based status per check; missing evidence is never a pass."""
+    checks = []
+    seasons = {2022, 2023, 2024, 2025, 2026}
+
+    def add(check: str, status: str, evidence: str):
+        checks.append({"Data check": check, "Status": status, "Evidence": evidence})
+
+    def years(frame):
+        if frame.empty or "season" not in frame:
+            return set()
+        return set(pd.to_numeric(frame["season"], errors="coerce").dropna().astype(int).tolist())
+
+    found = years(coverage)
+    add("Five historical seasons represented", "Pass" if seasons <= found else "Review",
+        f"{len(seasons & found)} of 5 required seasons in coverage audit")
+
+    if coverage.empty or not seasons <= found:
+        add("Completed D1 game-stat coverage", "Unavailable", "Five-season audit not available")
+        add("Final score consistency", "Unavailable", "Five-season audit not available")
+    else:
+        c = coverage.loc[coverage["season"].isin(seasons)].copy()
+        for col in ("d1_matchups", "usable_stat_games", "score_mismatches"):
+            c[col] = pd.to_numeric(c[col], errors="coerce")
+        denominator = c["d1_matchups"].sum(min_count=1)
+        numerator = c["usable_stat_games"].sum(min_count=1)
+        pct = 100 * numerator / denominator if pd.notna(denominator) and denominator > 0 else float("nan")
+        add("Completed D1 game-stat coverage",
+            "Unavailable" if pd.isna(pct) else "Pass" if pct >= 95 else "Review",
+            f"{pct:.1f}% with usable box scores (95% descriptive flag)" if pd.notna(pct)
+            else "No eligible D1 games")
+        mismatch = c["score_mismatches"].sum(min_count=1)
+        add("Final score consistency",
+            "Unavailable" if pd.isna(mismatch) else "Pass" if mismatch == 0 else "Review",
+            f"{int(mismatch):,} mismatched records" if pd.notna(mismatch) else "Missing audit counts")
+
+    fyears = years(features)
+    add("Pregame feature seasons", "Pass" if seasons <= fyears else "Review",
+        f"{len(seasons & fyears)} of 5 seasons have pregame features")
+    if features.empty or not seasons <= fyears:
+        add("Known snapshot-date violations", "Unavailable", "Five-season pregame audit not available")
+        add("Earlier adjusted-rating coverage", "Unavailable", "Five-season pregame audit not available")
+    else:
+        f = features.loc[features["season"].isin(seasons)].copy()
+        for col in ("nonprior_snapshot_dates", "unsafe_rating_values", "rows_with_5_games",
+                    "rows_with_prior_adjusted"):
+            f[col] = pd.to_numeric(f[col], errors="coerce")
+        violations = f["nonprior_snapshot_dates"].sum(min_count=1)
+        unsafe = f["unsafe_rating_values"].sum(min_count=1)
+        add("Known snapshot-date violations",
+            "Unavailable" if pd.isna(violations) or pd.isna(unsafe) else
+            "Pass" if violations == 0 and unsafe == 0 else "Review",
+            f"{int(violations):,} non-prior dates; {int(unsafe):,} unsafe values"
+            if pd.notna(violations) and pd.notna(unsafe) else "Missing date-check counts")
+        total = f["rows_with_5_games"].sum(min_count=1)
+        valid = f["rows_with_prior_adjusted"].sum(min_count=1)
+        pct = 100 * valid / total if pd.notna(total) and total > 0 else float("nan")
+        add("Earlier adjusted-rating coverage",
+            "Unavailable" if pd.isna(pct) else "Pass" if pct >= 75 else "Review",
+            f"{pct:.1f}% of rows with 5+ prior games (75% descriptive flag)"
+            if pd.notna(pct) else "No rows with five prior games")
+
+    if accuracy.empty or not {2025, 2026} <= years(accuracy):
+        add("Validation / holdout scoring baseline", "Unavailable",
+            "Both 2024–25 and 2025–26 baseline audits are required")
+    else:
+        a = accuracy.loc[accuracy["season"].isin([2025, 2026])].copy()
+        games = pd.to_numeric(a["evaluated_games"], errors="coerce")
+        mae = pd.to_numeric(a["points_mae"], errors="coerce")
+        valid = len(a) == 2 and bool(games.gt(0).all() and mae.notna().all())
+        add("Validation / holdout scoring baseline", "Pass" if valid else "Review",
+            f"2024–25 and 2025–26: {int(games.sum()):,} evaluated games; baseline only"
+            if games.notna().all() else "Missing evaluation counts")
+
+    if drift.empty:
+        add("Historical distribution drift", "Unavailable", "No eligible paired pregame rows")
+    else:
+        values = pd.to_numeric(drift["Largest |shift| (SD)"], errors="coerce").dropna()
+        add("Historical distribution drift",
+            "Unavailable" if len(values) != len(READINESS_METRICS) else
+            "Review" if values.ge(.5).any() else "Pass",
+            f"{int(values.ge(.5).sum())} metrics shifted ≥0.5 development SD"
+            if len(values) else "No comparable development statistics")
+    return pd.DataFrame(checks, columns=["Data check", "Status", "Evidence"])
+
+
+
+# Data Quality Exceptions: record-level review of the existing historical audits.
+# Read-only SQL, no modifications to ESPN rows or pregame tables. Current D1
+# flags are used; historical membership and missing ESPN reports are caveats.
+EXCEPTION_COUNTS_SQL = """
+SELECT (SELECT COUNT(*)
+        FROM games g
+        JOIN teams ht ON ht.team_id = g.home_team_id
+        JOIN teams at ON at.team_id = g.away_team_id
+        WHERE g.season = %s AND g.completed = 1
+          AND ht.is_d1 = 1 AND at.is_d1 = 1) AS d1_completed,
+       (SELECT COUNT(*) FROM pregame_team_features
+        WHERE season = %s) AS feature_rows
+"""
+
+EXCEPTION_GAME_SQL = """
+WITH src AS (
+    SELECT g.game_id, g.game_date::text AS game_date,
+           ht.name AS home_team, at.name AS away_team,
+           g.home_score, g.away_score,
+           hs.game_id IS NOT NULL AS home_box_present,
+           axs.game_id IS NOT NULL AS away_box_present,
+           hs.points AS home_box_points, axs.points AS away_box_points,
+           hs.possessions AS home_possessions, axs.possessions AS away_possessions
+    FROM games g
+    JOIN teams ht ON ht.team_id = g.home_team_id
+    JOIN teams at ON at.team_id = g.away_team_id
+    LEFT JOIN team_game_stats hs ON hs.game_id = g.game_id
+                                  AND hs.team_id = g.home_team_id
+    LEFT JOIN team_game_stats axs ON axs.game_id = g.game_id
+                                   AND axs.team_id = g.away_team_id
+    WHERE g.season = %s AND g.completed = 1
+      AND ht.is_d1 = 1 AND at.is_d1 = 1
+)
+SELECT * FROM src
+WHERE home_score IS NULL OR away_score IS NULL
+   OR NOT home_box_present OR NOT away_box_present
+   OR home_box_points IS NULL OR away_box_points IS NULL
+   OR home_possessions IS NULL OR away_possessions IS NULL
+   OR home_possessions <= 0 OR away_possessions <= 0
+   OR home_box_points IS DISTINCT FROM home_score
+   OR away_box_points IS DISTINCT FROM away_score
+ORDER BY game_date, game_id
+"""
+
+EXCEPTION_FEATURE_SQL = """
+SELECT f.game_id, f.game_date::text AS game_date,
+       t.name AS team, o.name AS opponent,
+       f.games_before, f.rest_days, f.adjusted_net_before,
+       f.opponent_sos_before, f.rating_snapshot_date::text AS rating_snapshot_date
+FROM pregame_team_features f
+JOIN teams t ON t.team_id = f.team_id
+JOIN teams o ON o.team_id = f.opponent_id
+WHERE f.season = %s AND (
+      f.games_before < 0 OR f.rest_days < 0
+   OR (f.rating_snapshot_date IS NOT NULL
+       AND f.rating_snapshot_date::text >= f.game_date::text)
+   OR ((f.adjusted_net_before IS NOT NULL OR f.opponent_sos_before IS NOT NULL)
+       AND (f.rating_snapshot_date IS NULL
+            OR f.rating_snapshot_date::text >= f.game_date::text))
+   OR (f.games_before >= 5 AND (f.adjusted_net_before IS NULL
+                                OR f.opponent_sos_before IS NULL))
+)
+ORDER BY f.game_date, f.game_id, t.name
+"""
+
+# A pregame feature pair is expected only for an otherwise usable completed
+# game. Earlier same-day games are intentionally not introduced as prior form.
+EXCEPTION_PAIR_SQL = """
+SELECT g.game_id, g.game_date::text AS game_date,
+       ht.name AS home_team, at.name AS away_team,
+       hf.game_id IS NOT NULL AS has_home_feature,
+       af.game_id IS NOT NULL AS has_away_feature
+FROM games g
+JOIN teams ht ON ht.team_id = g.home_team_id
+JOIN teams at ON at.team_id = g.away_team_id
+JOIN team_game_stats hs ON hs.game_id = g.game_id AND hs.team_id = g.home_team_id
+JOIN team_game_stats axs ON axs.game_id = g.game_id AND axs.team_id = g.away_team_id
+LEFT JOIN pregame_team_features hf ON hf.game_id = g.game_id
+                                   AND hf.team_id = g.home_team_id
+LEFT JOIN pregame_team_features af ON af.game_id = g.game_id
+                                   AND af.team_id = g.away_team_id
+WHERE g.season = %s AND g.completed = 1 AND ht.is_d1 = 1 AND at.is_d1 = 1
+  AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+  AND hs.points = g.home_score AND axs.points = g.away_score
+  AND hs.possessions > 0 AND axs.possessions > 0
+  AND (hf.game_id IS NULL OR af.game_id IS NULL)
+ORDER BY g.game_date, g.game_id
+"""
+
+
+def exception_game_table(rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Game date", "Matchup", "Game ID", "Issues", "Final", "Box score"]
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    records = []
+    for _, r in rows.iterrows():
+        issues = []
+        if pd.isna(r["home_score"]) or pd.isna(r["away_score"]):
+            issues.append("Missing final score")
+        if not bool(r["home_box_present"]) or not bool(r["away_box_present"]):
+            issues.append("Missing team box score")
+        if pd.isna(r["home_box_points"]) or pd.isna(r["away_box_points"]):
+            issues.append("Missing box-score points")
+        if (pd.isna(r["home_possessions"]) or pd.isna(r["away_possessions"]) or
+            (pd.notna(r["home_possessions"]) and float(r["home_possessions"]) <= 0) or
+            (pd.notna(r["away_possessions"]) and float(r["away_possessions"]) <= 0)):
+            issues.append("Invalid possessions")
+        if ((pd.notna(r["home_box_points"]) and pd.notna(r["home_score"])
+             and float(r["home_box_points"]) != float(r["home_score"])) or
+            (pd.notna(r["away_box_points"]) and pd.notna(r["away_score"])
+             and float(r["away_box_points"]) != float(r["away_score"]))):
+            issues.append("Box score / final mismatch")
+        if issues:
+            def printed(value):
+                return "—" if pd.isna(value) else str(int(value))
+            records.append({"Game date": str(r["game_date"])[:10],
+                            "Matchup": f"{r['away_team']} @ {r['home_team']}",
+                            "Game ID": str(r["game_id"]),
+                            "Issues": "; ".join(issues),
+                            "Final": f"{printed(r['away_score'])}–{printed(r['home_score'])}",
+                            "Box score": f"{printed(r['away_box_points'])}–{printed(r['home_box_points'])}"})
+    return pd.DataFrame(records, columns=columns)
+
+
+def exception_feature_table(rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Game date", "Team", "Opponent", "Game ID", "Issues",
+               "Previous games", "Rating snapshot"]
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    records = []
+    for _, r in rows.iterrows():
+        issues = []
+        day = str(r["game_date"])[:10]
+        snap = "" if pd.isna(r["rating_snapshot_date"]) else str(r["rating_snapshot_date"])[:10]
+        if snap and snap >= day:
+            issues.append("Non-prior rating date")
+        if (pd.notna(r["adjusted_net_before"]) or pd.notna(r["opponent_sos_before"])) and (not snap or snap >= day):
+            issues.append("Adjusted rating without valid earlier date")
+        if int(r["games_before"]) >= 5 and (pd.isna(r["adjusted_net_before"]) or pd.isna(r["opponent_sos_before"])):
+            issues.append("Prior adjusted rating unavailable (review)")
+        if pd.notna(r["rest_days"]) and int(r["rest_days"]) < 0:
+            issues.append("Negative rest days")
+        if int(r["games_before"]) < 0:
+            issues.append("Negative previous games")
+        if issues:
+            records.append({"Game date": day, "Team": str(r["team"]),
+                            "Opponent": str(r["opponent"]), "Game ID": str(r["game_id"]),
+                            "Issues": "; ".join(issues),
+                            "Previous games": int(r["games_before"]),
+                            "Rating snapshot": snap or "—"})
+    return pd.DataFrame(records, columns=columns)
+
+
+def exception_pair_table(rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Game date", "Matchup", "Game ID", "Missing pregame records"]
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    records = []
+    for _, r in rows.iterrows():
+        missing = []
+        if not bool(r["has_home_feature"]):
+            missing.append("Home")
+        if not bool(r["has_away_feature"]):
+            missing.append("Away")
+        if missing:
+            records.append({"Game date": str(r["game_date"])[:10],
+                            "Matchup": f"{r['away_team']} @ {r['home_team']}",
+                            "Game ID": str(r["game_id"]),
+                            "Missing pregame records": ", ".join(missing)})
+    return pd.DataFrame(records, columns=columns)
+
+
+def exception_issue_summary(table: pd.DataFrame) -> pd.DataFrame:
+    """Count issue *labels* across records, not only the number of bad games."""
+    if table.empty or "Issues" not in table.columns:
+        return pd.DataFrame(columns=["Issue", "Records"])
+    issues = table["Issues"].str.split("; ").explode().dropna()
+    if issues.empty:
+        return pd.DataFrame(columns=["Issue", "Records"])
+    return (issues.value_counts().rename_axis("Issue")
+                  .reset_index(name="Records"))
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Historical Data Readiness", "Data Quality Exceptions", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -3423,6 +3819,225 @@ elif page == "Season Data Drift":
                            "its independence if it is later used to tune a model. "
                            "Treat these as retrospective diagnostics only.")
     st.caption("Read-only dashboard; no new Supabase tables or scheduled jobs required.")
+
+elif page == "Historical Data Readiness":
+    st.subheader("Historical Data Readiness — Consolidated Audit")
+    st.caption("A single place to review the integrity, coverage, and descriptive stability "
+               "of your five-season historical basketball dataset. Check statuses are "
+               "data-quality heuristics, not a prediction-model score or guarantee.")
+    presence = query("""
+        SELECT to_regclass('public.historical_coverage_audit') IS NOT NULL AS coverage,
+               to_regclass('public.pregame_team_features') IS NOT NULL AS features,
+               to_regclass('public.historical_score_baseline_audit') IS NOT NULL AS baseline
+    """)
+    if presence.empty or not all(bool(presence.iloc[0][key]) for key in
+                                 ("coverage", "features", "baseline")):
+        st.info("Some historical QA tables are missing. Run GitHub Actions → "
+                "Verify NCAA MBB Historical Pregame Data, then refresh this page.")
+    else:
+        coverage = query(READINESS_COVERAGE_SQL, (2022, 2026))
+        pregame = query(READINESS_FEATURES_SQL, (2022, 2026))
+        baseline = query(READINESS_ACCURACY_SQL, (2022, 2026))
+        # Pull the already-audited 2-sided, completed-game input for the drift
+        # comparison. Missing and non-prior adjusted ratings are masked, not
+        # replaced with current or final-season values.
+        raw = query(FEATURE_ANALYSIS_SQL, (2022, 2026))
+        valid = historical_drift_prepare(raw, min_history=5)
+        drift = readiness_drift_display(valid)
+        overview = readiness_checklist(coverage, pregame, baseline, drift)
+        counts = overview["Status"].value_counts()
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Checks passed", int(counts.get("Pass", 0)))
+        col2.metric("Review flags", int(counts.get("Review", 0)))
+        col3.metric("Unavailable checks", int(counts.get("Unavailable", 0)))
+        st.markdown("#### Checklist")
+        show_table(overview)
+        st.caption("Heuristics: at least 95% usable completed D1 matchups; at least "
+                   "75% earlier-date adjusted ratings for team rows with five prior games; "
+                   "and 0 known non-prior snapshot dates or score mismatches. "
+                   "Distribution shifts ≥0.5 development standard deviations are flagged "
+                   "for investigation, not treated as proof of a defect.")
+        cover_tab, time_tab, drift_tab, benchmark_tab, limitations_tab = st.tabs([
+            "Game coverage", "Temporal checks", "Season drift", "Scoring baseline", "Interpretation"
+        ])
+        with cover_tab:
+            st.markdown("#### Usable historical D1 matchup coverage")
+            display = readiness_coverage_display(coverage)
+            if display.empty:
+                st.warning("No game-coverage audit rows yet.")
+            else:
+                show_table(display)
+                st.download_button("Download game coverage", display.to_csv(index=False),
+                                   file_name="ncaa_readiness_coverage.csv", mime="text/csv",
+                                   key="readiness_coverage_csv")
+                st.caption("Percentages use completed D1-vs-D1 matchups as the denominator. "
+                           "Canceled and postponed games are not treated as missing completed games. "
+                           "Current D1 labels may not reflect historical membership.")
+        with time_tab:
+            st.markdown("#### Strictly earlier-dated adjusted ratings")
+            display = readiness_feature_display(pregame)
+            if display.empty:
+                st.warning("No pregame feature audit rows yet.")
+            else:
+                show_table(display)
+                st.download_button("Download pregame audit", display.to_csv(index=False),
+                                   file_name="ncaa_readiness_pregame.csv", mime="text/csv",
+                                   key="readiness_pregame_csv")
+                st.caption("A rating recorded on the game date itself is not accepted as "
+                           "pregame. Counts verify snapshot timestamps and stored values. "
+                           "They cannot by themselves prove that every earlier snapshot "
+                           "was computed without future information.")
+        with drift_tab:
+            st.markdown("#### Validation and holdout distribution changes")
+            if drift.empty:
+                st.info("Not enough paired pregame rows to assess statistical drift.")
+            else:
+                show_table(drift)
+                st.download_button("Download drift overview", drift.to_csv(index=False),
+                                   file_name="ncaa_readiness_drift.csv", mime="text/csv",
+                                   key="readiness_drift_csv")
+                st.caption("Shifts show differences in historical pregame distributions, "
+                           "scaled by variability in the development seasons. A warning "
+                           "does not establish poor model accuracy or causation. "
+                           "See Season Data Drift for detailed graphs.")
+        with benchmark_tab:
+            st.markdown("#### Existing scoring-average baseline across seasons")
+            if baseline.empty:
+                st.warning("No baseline audit rows yet.")
+            else:
+                display = baseline.rename(columns={
+                    "season": "ESPN season", "split_name": "Historical split",
+                    "eligible_d1_games": "D1 completed games",
+                    "evaluated_games": "Evaluated games",
+                    "evaluated_team_scores": "Team scores",
+                    "points_mae": "MAE (pts)", "points_rmse": "RMSE (pts)",
+                    "points_bias": "Bias (pts)",
+                })
+                show_table(display)
+                st.download_button("Download scoring-baseline audit",
+                                   display.to_csv(index=False),
+                                   file_name="ncaa_readiness_baseline.csv", mime="text/csv",
+                                   key="readiness_baseline_csv")
+                st.caption("These are historical errors for an unfitted prior-points-per-game "
+                           "benchmark, not a trained forecast model. Do not tune methods "
+                           "to repeated results from the 2025–26 holdout.")
+        with limitations_tab:
+            st.markdown("#### What the readiness checklist cannot establish")
+            st.markdown("- All tests describe historical records and do not prove "
+                        "that future forecasts will be accurate.\n"
+                        "- Snapshot date checks detect known chronology violations; "
+                        "source-code and importer audits are still needed to rule out "
+                        "every form of future-data leakage.\n"
+                        "- Historical conference membership and player availability "
+                        "may be incomplete.\n"
+                        "- The 2025–26 historical holdout should be preserved for "
+                        "independent evaluation rather than repeated method tuning.\n"
+                        "- This page does not train a model, provide odds, or "
+                        "recommend wagers.")
+            st.download_button("Download full readiness checklist",
+                               overview.to_csv(index=False),
+                               file_name="ncaa_historical_data_readiness.csv", mime="text/csv",
+                               key="readiness_checklist_csv")
+    st.caption("Read-only: no new database tables, dependencies, or workflows required.")
+
+
+elif page == "Data Quality Exceptions":
+    st.subheader("Data Quality Exceptions — Record-Level Review")
+    st.caption("Find individual records behind historical coverage or pregame-readiness warnings. "
+               "This page is read-only; it does not modify or repair game records.")
+    chosen_season = st.selectbox("Season to inspect (ESPN ending year)",
+                                  [2027, 2026, 2025, 2024, 2023, 2022],
+                                  index=1, format_func=historical_season_label,
+                                  key="quality_exception_season")
+    tabcheck = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS available")
+    if tabcheck.empty or not bool(tabcheck.iloc[0]["available"]):
+        st.warning("Pregame feature table is missing. Run GitHub Actions → "
+                   "Verify NCAA MBB Historical Pregame Data before using this page.")
+    else:
+        totals = query(EXCEPTION_COUNTS_SQL, (chosen_season, chosen_season))
+        completed_count = int(totals.iloc[0]["d1_completed"]) if not totals.empty else 0
+        feature_count = int(totals.iloc[0]["feature_rows"]) if not totals.empty else 0
+        st.caption(f"Season coverage: {completed_count:,} completed D1 matchups and "
+                   f"{feature_count:,} pregame team-feature rows in Supabase.")
+        if completed_count == 0 or feature_count == 0:
+            st.warning("No completed D1 games or no pregame features were found "
+                       "for this season. This is not a clean audit: verify imports "
+                       "and rerun the historical pregame workflow.")
+        game_raw = query(EXCEPTION_GAME_SQL, (chosen_season,))
+        feature_raw = query(EXCEPTION_FEATURE_SQL, (chosen_season,))
+        pair_raw = query(EXCEPTION_PAIR_SQL, (chosen_season,))
+        game_issues = exception_game_table(game_raw)
+        feature_issues = exception_feature_table(feature_raw)
+        paired_issues = exception_pair_table(pair_raw)
+        a, b, c = st.columns(3)
+        a.metric("Games with box-score issues", len(game_issues))
+        b.metric("Pregame feature rows to review", len(feature_issues))
+        c.metric("Usable games missing feature pairs", len(paired_issues))
+        st.caption("Counts cover the selected season only. Games with several issues "
+                   "appear once in the corresponding record table; postponed and "
+                   "canceled games are excluded. Missing *prior* ratings can be "
+                   "legitimate coverage gaps rather than incorrect values.")
+        games_tab, features_tab, pairs_tab, notes_tab = st.tabs([
+            "Game / box-score issues", "Pregame rating checks",
+            "Missing pregame pairs", "What to do"
+        ])
+        with games_tab:
+            st.markdown("#### Completed Division I matchup records to investigate")
+            if game_issues.empty:
+                st.success("No box-score exceptions found for the selected season.")
+            else:
+                summary = exception_issue_summary(game_issues)
+                show_table(summary)
+                all_types = summary["Issue"].tolist()
+                selected_types = st.multiselect("Filter game issue types", all_types,
+                                                default=all_types,
+                                                key="quality_game_issue_filter")
+                visible = game_issues.loc[game_issues["Issues"].apply(
+                    lambda x: any(label in x.split("; ") for label in selected_types))]
+                show_table(visible)
+                st.download_button("Download all game exceptions (CSV)",
+                                   game_issues.to_csv(index=False),
+                                   file_name=f"ncaa_game_exceptions_{chosen_season}.csv",
+                                   mime="text/csv", key="quality_game_csv")
+        with features_tab:
+            st.markdown("#### Pregame snapshot and rating coverage")
+            if feature_issues.empty:
+                st.success("No prior-rating exceptions or coverage gaps found.")
+            else:
+                show_table(exception_issue_summary(feature_issues))
+                show_table(feature_issues)
+                st.download_button("Download pregame exceptions (CSV)",
+                                   feature_issues.to_csv(index=False),
+                                   file_name=f"ncaa_feature_exceptions_{chosen_season}.csv",
+                                   mime="text/csv", key="quality_feature_csv")
+            st.caption("A missing adjusted rating after five earlier games is a review "
+                       "item, not proof of a bad import. Same-day or future-dated "
+                       "snapshots must never count as pregame statistics.")
+        with pairs_tab:
+            st.markdown("#### Usable completed D1 games missing either side's features")
+            if paired_issues.empty:
+                st.success("Every eligible game checked has a pair of pregame records.")
+            else:
+                show_table(paired_issues)
+                st.download_button("Download missing pairs (CSV)",
+                                   paired_issues.to_csv(index=False),
+                                   file_name=f"ncaa_missing_feature_pairs_{chosen_season}.csv",
+                                   mime="text/csv", key="quality_pairs_csv")
+        with notes_tab:
+            st.markdown("#### Interpret exceptions carefully")
+            st.markdown("- **Missing box scores / score mismatches:** Check the ESPN "
+                        "game record and the nightly importer logs; do not manufacture "
+                        "results or mark canceled games completed.\n"
+                        "- **Missing pregame feature pair:** Run the existing "
+                        "Verify NCAA MBB Historical Pregame Data workflow and refresh.\n"
+                        "- **Same-day/future snapshot:** Investigate snapshot generation "
+                        "and chronology; never use the affected rating as pregame data.\n"
+                        "- **Unavailable prior adjusted ratings:** A legitimate coverage "
+                        "gap can occur; don't replace it with an end-of-season value.\n"
+                        "- **Conference / Division I flags:** These use current team "
+                        "metadata, which may not exactly match historical membership.")
+            st.caption("Read-only audit. No database changes, additional credentials, "
+                       "background tasks, or upcoming-game forecasts.")
 
 elif page == "Advanced Matchup Comparison":
     st.subheader("Advanced Matchup Comparison")
