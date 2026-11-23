@@ -247,7 +247,7 @@ def current_roster_profiles(team_id: str) -> dict[str, dict]:
 
 def player_averages_display_rows(frame: pd.DataFrame, profiles: dict[str, dict],
                                  injury_by_player: dict[str, dict] | None = None) -> pd.DataFrame:
-    """Combine name/jersey/ESPN injury, plus roster height and weight."""
+    """Combine player name/jersey and official game availability, plus roster details."""
     shown = frame.copy()
     injury_by_player = injury_by_player or {}
     visible_names = []
@@ -965,7 +965,9 @@ elif page == "Player season averages":
                    f"{filtered['team'].nunique():,} teams. "
                    "GP = games played; MPG = minutes; PPG = points; RPG = rebounds; "
                    "APG = assists; SPG = steals; BPG = blocks; TOPG = turnovers. "
-                   "⛑️ means ESPN currently reports an injury; reports may be incomplete.")
+                   "⛑️ means a participating conference reported a player as not fully "
+                   "available for an upcoming conference game; it does not necessarily "
+                   "mean the player is injured. No marker does not mean healthy.")
         if filtered.empty:
             st.info("No players match your selected filters.")
         else:
@@ -977,19 +979,23 @@ elif page == "Player season averages":
             elif season == latest_season:
                 st.caption("Select one team to retrieve current roster height and weight "
                            "from ESPN. Missing details are shown as —.")
-            # Only annotate the current season. ESPN's injuries endpoint reflects
-            # current reports, not historical availability. Use a 72-hour freshness
-            # window so failed updates don't keep showing old injury labels.
+            # Official conference reports are GAME-SPECIFIC, not general diagnoses.
+            # Display only reports for games today through two days ahead, so an
+            # old "Out" designation cannot remain attached after that game.
             injury_by_player = {}
             if season == latest_season:
-                freshness_cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat(timespec="seconds")
+                today_central = datetime.now(CENTRAL).date()
                 injury_rows = query("""
                     SELECT source_player_id, injury_detail, status, retrieved_at
                     FROM injury_reports
-                    WHERE source = %s AND retrieved_at >= %s
+                    WHERE source = %s
+                      AND raw_json::jsonb->>'game_date' >= %s
+                      AND raw_json::jsonb->>'game_date' <= %s
                       AND source_player_id IS NOT NULL
-                    ORDER BY retrieved_at DESC
-                """, ("ESPN", freshness_cutoff))
+                    ORDER BY raw_json::jsonb->>'game_date' ASC,
+                             reported_at DESC, retrieved_at DESC
+                """, ("Official conference report", today_central.isoformat(),
+                      (today_central + timedelta(days=2)).isoformat()))
                 for _, injury in injury_rows.iterrows():
                     player_id = str(injury["source_player_id"])
                     if player_id not in injury_by_player:
@@ -1013,28 +1019,59 @@ elif page == "Player season averages":
                                f"ncaa_player_season_averages_{season}.csv", "text/csv")
 
 elif page == "Injuries":
-    st.subheader("ESPN-reported player injuries")
-    st.info("This page contains only injuries ESPN has reported, not a complete college "
-            "basketball availability list. No report does **not** mean a player is healthy.")
-    freshness_cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat(timespec="seconds")
-    reports = query("""
-        SELECT player_name,team_name,status,injury_detail,expected_return,reported_at,retrieved_at
-        FROM injury_reports
-        WHERE source = %s AND retrieved_at >= %s
-        ORDER BY retrieved_at DESC, player_name ASC LIMIT 500
-    """, ("ESPN", freshness_cutoff))
-    if reports.empty:
-        st.info("No recent injury entries were returned by ESPN. ESPN's men's college "
-                "basketball injury feed is often empty or incomplete.")
+    st.subheader("Official conference player availability")
+    st.caption("Statuses come from manually verified official conference reports "
+               "for individual conference games. Out, Questionable, or Doubtful "
+               "does not necessarily mean an injury. Missing reports are not proof "
+               "that a player is healthy or available.")
+    st.markdown(
+        "Official sources: "
+        "[SEC](https://www.secsports.com/reports) · "
+        "[ACC](https://theacc.com/sports/2025/12/29/availability-reporting-mbb.aspx) · "
+        "[Big 12](https://big12sports.com/sports/2026/1/1/MBBreporting.aspx) · "
+        "[Big East](https://www.bigeast.com/news/2025/12/12/general-big-east-to-provide-public-availability-reports-for-mens-and-womens-basketball.aspx)"
+    )
+    today_central = datetime.now(CENTRAL).date()
+    left, right = st.columns(2)
+    with left:
+        first_date = st.date_input("From game date", value=today_central, key="conf_start")
+    with right:
+        last_date = st.date_input("Through game date", value=today_central + timedelta(days=3),
+                                  key="conf_end")
+    if last_date < first_date:
+        st.warning("The end game date must not be before the start date.")
     else:
-        st.caption(f"{len(reports):,} ESPN injury entries shown; most recent retrieval: "
-                   f"{reports['retrieved_at'].max()} UTC. Status and return estimates "
-                   "are ESPN reports, not independently verified.")
-        show_table(reports.rename(columns={
-            "player_name": "Player", "team_name": "Team", "status": "Status",
-            "injury_detail": "Injury", "expected_return": "Expected return",
-            "reported_at": "Reported", "retrieved_at": "Last checked (UTC)",
-        }))
+        reports = query("""
+            SELECT player_name, team_name, status,
+                   raw_json::jsonb->>'conference' AS conference,
+                   raw_json::jsonb->>'game_date' AS game_date,
+                   raw_json::jsonb->>'source_url' AS source_url,
+                   reported_at, retrieved_at
+            FROM injury_reports
+            WHERE source = %s
+              AND raw_json::jsonb->>'game_date' >= %s
+              AND raw_json::jsonb->>'game_date' <= %s
+            ORDER BY raw_json::jsonb->>'game_date' ASC,
+                     reported_at DESC, player_name ASC
+            LIMIT 1000
+        """, ("Official conference report", first_date.isoformat(), last_date.isoformat()))
+        if reports.empty:
+            st.info("No verified conference availability reports entered for these game dates. "
+                    "This is common before conference play begins. Check the official sources "
+                    "above; an empty list does not mean no players are unavailable.")
+        else:
+            st.caption(f"{len(reports):,} conference availability entries. "
+                       "Statuses apply only to the corresponding game dates. "
+                       "The source links open the original reports.")
+            display = reports.rename(columns={
+                "player_name": "Player", "team_name": "Team", "status": "Status",
+                "conference": "Conference", "game_date": "Game date",
+                "source_url": "Official source", "reported_at": "Report time (UTC)",
+                "retrieved_at": "Imported (UTC)",
+            })
+            st.dataframe(display, use_container_width=True, hide_index=True,
+                         column_config={"Official source": st.column_config.LinkColumn(
+                             "Official source", display_text="Open report")})
 
 else:
     st.subheader("Cloud update status")
@@ -1056,4 +1093,5 @@ else:
 st.divider()
 st.caption("Off/100 and Def/100 are based on estimated possessions and are not opponent-adjusted. "
            "AP poll is fetched from ESPN when available; team logos and conferences come from imported ESPN data. "
-           "ESPN endpoints are unofficial and may change; nightly updates and AP poll availability are not guaranteed.")
+           "ESPN endpoints are unofficial and may change; nightly updates and AP poll availability are not guaranteed. "
+           "Official conference availability reports are separately verified and game-specific.")
