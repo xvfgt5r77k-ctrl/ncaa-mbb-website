@@ -83,8 +83,16 @@ ORDER BY net_eff DESC, name ASC
 # Shooting percentages use total makes / total attempts, not an average of game percentages.
 PLAYER_SEASON_AVERAGES_QUERY = """
 WITH appearances AS (
-    SELECT t.team_id, t.name AS school, p.player_id, p.name AS player,
-           p.position,
+    SELECT t.team_id, t.name AS team, p.player_id, p.name AS player,
+           p.position, p.jersey,
+           NULLIF(COALESCE(
+               s.raw_json::jsonb #>> '{athlete,displayHeight}',
+               s.raw_json::jsonb #>> '{athlete,height}'
+           ), '') AS height_raw,
+           NULLIF(COALESCE(
+               s.raw_json::jsonb #>> '{athlete,displayWeight}',
+               s.raw_json::jsonb #>> '{athlete,weight}'
+           ), '') AS weight_raw,
            CASE
              WHEN BTRIM(s.minutes) ~ '^[0-9]+:[0-9]{1,2}$'
                THEN SPLIT_PART(BTRIM(s.minutes), ':', 1)::numeric
@@ -103,7 +111,8 @@ WITH appearances AS (
       AND (BTRIM(s.minutes) ~ '^[0-9]+:[0-9]{1,2}$'
            OR BTRIM(s.minutes) ~ '^[0-9]+([.][0-9]+)?$')
 )
-SELECT school, team_id, player_id, player, position,
+SELECT team, team_id, player_id, player, position, jersey,
+       MAX(height_raw) AS height_raw, MAX(weight_raw) AS weight_raw,
        COUNT(*) AS gp,
        ROUND(AVG(minutes_played), 1)::double precision AS mpg,
        ROUND(AVG(COALESCE(points, 0)), 1)::double precision AS ppg,
@@ -116,14 +125,108 @@ SELECT school, team_id, player_id, player, position,
        ROUND(100.0 * COALESCE(SUM(three_m), 0) / NULLIF(SUM(three_a), 0), 1)::double precision AS three_pct,
        ROUND(100.0 * COALESCE(SUM(ft_m), 0) / NULLIF(SUM(ft_a), 0), 1)::double precision AS ft_pct
 FROM appearances
-GROUP BY school, team_id, player_id, player, position
-ORDER BY LOWER(school), ppg DESC, LOWER(player)
+GROUP BY team, team_id, player_id, player, position, jersey
+ORDER BY LOWER(team), ppg DESC, LOWER(player)
 """
 
 
 def show_table(frame: pd.DataFrame, columns: list[str] | None = None):
     st.dataframe(frame[columns] if columns else frame, use_container_width=True,
                  hide_index=True)
+
+
+def _visible_jersey(value) -> str:
+    """Only append a jersey number when the importer actually has one."""
+    if value is None or pd.isna(value):
+        return ""
+    number = str(value).strip()
+    return number if number and number.lower() not in ("nan", "none", "null") else ""
+
+
+def _display_height(value) -> str:
+    """ESPN provides displayHeight (e.g. 6' 5\") or numeric inches."""
+    if value is None or pd.isna(value):
+        return "—"
+    text = str(value).strip()
+    if not text:
+        return "—"
+    if text.replace(".", "", 1).isdigit():
+        inches = float(text)
+        if 48 <= inches <= 96:
+            return f"{int(inches) // 12}'{int(inches) % 12}\""
+        return "—"
+    return text
+
+
+def _display_weight(value) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    text = str(value).strip()
+    if not text:
+        return "—"
+    if text.replace(".", "", 1).isdigit():
+        pounds = float(text)
+        return f"{int(pounds)} lbs" if 80 <= pounds <= 500 else "—"
+    return text
+
+
+def _extract_roster_athletes(payload: dict) -> list[dict]:
+    """Support ESPN's team detail and roster endpoints without guessing IDs."""
+    team = payload.get("team") or {}
+    athletes = team.get("athletes") or payload.get("athletes") or []
+    if isinstance(athletes, dict):
+        athletes = athletes.get("items") or athletes.get("athletes") or []
+    found = []
+    if not isinstance(athletes, list):
+        return found
+    for item in athletes:
+        if not isinstance(item, dict):
+            continue
+        # Some rosters group athletes inside categories (e.g. guards/forwards).
+        entries = item.get("items") or item.get("athletes")
+        if isinstance(entries, list):
+            found.extend(e for e in entries if isinstance(e, dict))
+        elif item.get("id") is not None:
+            found.append(item)
+    return found
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def current_roster_profiles(team_id: str) -> dict[str, dict]:
+    """Fetch one selected team's CURRENT ESPN roster; don't scan every D1 team."""
+    if not str(team_id).isdigit():
+        return {}
+    url = ("https://site.api.espn.com/apis/site/v2/sports/basketball/"
+           f"mens-college-basketball/teams/{team_id}")
+    try:
+        response = requests.get(url, params={"enable": "roster"}, timeout=10,
+                                headers={"Accept": "application/json",
+                                         "User-Agent": "NCAA-MBB-Dashboard/1.0"})
+        response.raise_for_status()
+        athletes = _extract_roster_athletes(response.json())
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return {}
+    return {str(player["id"]): player for player in athletes if player.get("id") is not None}
+
+
+def player_averages_display_rows(frame: pd.DataFrame, profiles: dict[str, dict]) -> pd.DataFrame:
+    """Add visible player jersey, height and weight without changing stat totals."""
+    shown = frame.copy()
+    visible_names = []
+    heights = []
+    weights = []
+    for _, row in shown.iterrows():
+        profile = profiles.get(str(row["player_id"]), {})
+        number = _visible_jersey(row.get("jersey")) or _visible_jersey(profile.get("jersey"))
+        visible_names.append(str(row["player"]) + (f" #{number}" if number else ""))
+        height = profile.get("displayHeight") or profile.get("height") or row.get("height_raw")
+        weight = profile.get("displayWeight") or profile.get("weight") or row.get("weight_raw")
+        heights.append(_display_height(height))
+        weights.append(_display_weight(weight))
+    shown["player"] = visible_names
+    shown["height"] = heights
+    shown["weight"] = weights
+    return shown
 
 
 SCHEDULE_QUERY = """
@@ -594,19 +697,29 @@ elif page == "Team explorer":
 elif page == "Player season averages":
     st.subheader("Player season averages")
     st.caption("Season-to-date NCAA Division I men's basketball averages from imported completed "
-               "games. Sorted alphabetically by school, then by points per game within each "
-               "school. DNP entries are excluded. Shooting percentages are based on total "
+               "games. Sorted alphabetically by team, then by points per game within each "
+               "team. DNP entries are excluded. Shooting percentages are based on total "
                "made / attempted shots.")
     averages = query(PLAYER_SEASON_AVERAGES_QUERY, (season,))
     if averages.empty:
         st.info("No player appearances are available for this season. "
                 "Make sure the season has been imported in GitHub Actions.")
     else:
-        school_options = ["All schools"] + sorted(averages["school"].dropna().unique().tolist(),
-                                                  key=str.casefold)
-        school_col, player_col, gp_col = st.columns([2, 2, 1])
-        with school_col:
-            school = st.selectbox("School", school_options)
+        # Find an exact team from a searchable list. A search for Iowa also matches
+        # Iowa State, so provide a separate exact-team dropdown.
+        all_teams = sorted(averages["team"].dropna().unique().tolist(),
+                           key=str.casefold)
+        team_col, player_col, gp_col = st.columns([2, 2, 1])
+        with team_col:
+            team_search = st.text_input(
+                "Search teams", placeholder="Type a team name, e.g. Iowa")
+            search_text = team_search.strip().casefold()
+            matched_teams = [name for name in all_teams
+                             if search_text in name.casefold()]
+            all_label = "All matching teams" if search_text else "All teams"
+            selected_team = st.selectbox(
+                "Choose a team", [all_label] + matched_teams,
+                help="Type above to narrow teams, then choose one for an exact match.")
         with player_col:
             player_search = st.text_input("Find a player", placeholder="Search by player name")
         with gp_col:
@@ -614,29 +727,41 @@ elif page == "Player season averages":
                                          max_value=max(1, int(averages["gp"].max())),
                                          value=1, step=1)
         filtered = averages
-        if school != "All schools":
-            filtered = filtered.loc[filtered["school"] == school]
+        if search_text:
+            filtered = filtered.loc[filtered["team"].isin(matched_teams)]
+        if selected_team != all_label:
+            filtered = filtered.loc[filtered["team"] == selected_team]
         if player_search:
             filtered = filtered.loc[filtered["player"].str.contains(
                 player_search, case=False, regex=False, na=False)]
         filtered = filtered.loc[filtered["gp"] >= minimum_gp]
-        filtered = filtered.sort_values(["school", "ppg", "player"],
+        filtered = filtered.sort_values(["team", "ppg", "player"],
                                         ascending=[True, False, True],
-                                        key=None, kind="stable")
+                                        kind="stable")
         st.caption(f"{len(filtered):,} players shown across "
-                   f"{filtered['school'].nunique():,} schools. "
+                   f"{filtered['team'].nunique():,} teams. "
                    "GP = games played; MPG = minutes; PPG = points; RPG = rebounds; "
                    "APG = assists; SPG = steals; BPG = blocks; TOPG = turnovers.")
         if filtered.empty:
             st.info("No players match your selected filters.")
         else:
-            renamed = filtered.rename(columns={
-                "school": "School", "player": "Player", "position": "Pos",
+            profiles = {}
+            # A selected team needs only one ESPN roster request. The existing
+            # box-score athlete JSON supplies any already-stored height/weight.
+            if season == latest_season and filtered["team_id"].nunique() == 1:
+                profiles = current_roster_profiles(str(filtered.iloc[0]["team_id"]))
+            elif season == latest_season:
+                st.caption("Select one team to retrieve current roster height and weight "
+                           "from ESPN. Missing details are shown as —.")
+            shown = player_averages_display_rows(filtered, profiles)
+            renamed = shown.rename(columns={
+                "team": "Team", "player": "Player", "position": "Pos",
+                "height": "Height", "weight": "Weight",
                 "gp": "GP", "mpg": "MPG", "ppg": "PPG", "rpg": "RPG",
                 "apg": "APG", "spg": "SPG", "bpg": "BPG", "topg": "TOPG",
                 "fg_pct": "FG%", "three_pct": "3P%", "ft_pct": "FT%",
             })
-            columns = ["School", "Player", "Pos", "GP", "MPG", "PPG", "RPG",
+            columns = ["Team", "Player", "Pos", "Height", "Weight", "GP", "MPG", "PPG", "RPG",
                        "APG", "SPG", "BPG", "TOPG", "FG%", "3P%", "FT%"]
             table = renamed[columns]
             show_table(table)
