@@ -226,8 +226,7 @@ def schedule_display(games: pd.DataFrame, efficiency_ranks: dict[str, int],
                      conference_logos: dict[str, str] | None = None) -> pd.DataFrame:
     """A compact game table: AP ranks inline; logos in conference columns."""
     cols = ["Time (CT)", "Away logo", "Away", "Away conf.", "Away Eff.",
-            "Home logo", "Home", "Home conf.", "Home Eff.",
-            "Score (Away–Home)", "Status", "Venue"]
+            "Home logo", "Home", "Home conf.", "Home Eff.", "Venue"]
     if games.empty:
         return pd.DataFrame(columns=cols)
     output = pd.DataFrame(index=games.index)
@@ -245,16 +244,6 @@ def schedule_display(games: pd.DataFrame, efficiency_ranks: dict[str, int],
         output[prefix + " Eff."] = games[side + "_id"].map(
             lambda ident: rank_label(ident, efficiency_ranks))
 
-    def score(row):
-        if row["status"] in ("STATUS_SCHEDULED", "STATUS_POSTPONED", "STATUS_CANCELED"):
-            return "—"
-        if pd.notna(row["away_score"]) and pd.notna(row["home_score"]):
-            return f"{int(row['away_score'])}–{int(row['home_score'])}"
-        return "—"
-
-    output["Score (Away–Home)"] = games.apply(score, axis=1)
-    output["Status"] = games["status_detail"].fillna("")
-    output.loc[output["Status"].eq(""), "Status"] = games["status"].fillna("TBD")
     output["Venue"] = games["venue"].fillna("—")
     return output[cols]
 
