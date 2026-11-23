@@ -1,0 +1,30 @@
+name: Import official conference availability reports
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'data/conference_reports.csv'
+      - 'conference_report_import.py'
+      - '.github/workflows/conference-reports.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Import verified conference availability
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python conference_report_import.py --csv data/conference_reports.csv
