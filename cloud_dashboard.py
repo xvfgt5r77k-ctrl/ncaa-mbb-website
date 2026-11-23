@@ -1258,12 +1258,160 @@ def pregame_replay_table(rows: pd.DataFrame, home_id: str, away_id: str) -> pd.D
                           'Away':get(away_id,col,numeric)}
                          for title,col,numeric in fields])
 
+
+
+# Retrospective statistical reliability. Reuses the same audited historical
+# team-game dataset as Statistical Feature Analysis, adding current team
+# conference metadata for descriptive grouping. Conference names in the teams
+# table are NOT guaranteed to reflect historical membership after realignment.
+RELIABILITY_SQL = FEATURE_ANALYSIS_SQL.replace(
+    "t.name AS team,", "t.name AS team, COALESCE(t.conference, 'Unknown') AS current_conference,", 1
+)
+
+RELIABILITY_METRICS = {
+    "Prior adjusted net efficiency": ("prior_adj_net", "margin", "Actual scoring margin"),
+    "Prior strength of schedule": ("prior_sos", "margin", "Actual scoring margin"),
+    "Prior offensive efficiency": ("prior_offense", "points", "Actual points scored"),
+    "Prior defensive efficiency": ("prior_defense", "opp_points", "Actual points allowed"),
+    "Prior raw net efficiency": ("prior_raw_net", "margin", "Actual scoring margin"),
+    "Prior possessions per game": ("prior_pace", "total_points", "Actual combined points"),
+    "Recent five-game average margin": ("recent_margin", "margin", "Actual scoring margin"),
+    "Prior team scoring average": ("prior_ppg", "points", "Actual points scored"),
+}
+
+
+def reliability_pearson(group: pd.DataFrame, feature: str, outcome: str,
+                        min_rows: int = 30) -> float:
+    """Descriptive Pearson r only when sample and variation are adequate."""
+    pair = group[[feature, outcome]].dropna()
+    if (len(pair) < min_rows or pair[feature].nunique() < 2
+            or pair[outcome].nunique() < 2):
+        return float("nan")
+    return float(pair[feature].corr(pair[outcome]))
+
+
+def reliability_season_summary(data: pd.DataFrame, metric: str,
+                               min_rows: int = 30) -> pd.DataFrame:
+    """Correlation and coverage by season, using exclusively prior-date inputs."""
+    columns = ["Season", "Team-game rows", "Rows with statistic", "Coverage %",
+               "Distinct teams", "Pearson r"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    feature, outcome, _ = RELIABILITY_METRICS[metric]
+    result = []
+    for season, group in data.groupby("season", sort=True):
+        count = len(group)
+        available = int(group[[feature, outcome]].notna().all(axis=1).sum())
+        result.append({
+            "Season": f"{int(season)-1}–{str(int(season))[-2:]}",
+            "Team-game rows": count,
+            "Rows with statistic": available,
+            "Coverage %": round(100.0 * available / count, 1) if count else 0.0,
+            "Distinct teams": int(group["team_id"].nunique()),
+            "Pearson r": reliability_pearson(group, feature, outcome, min_rows),
+        })
+    return pd.DataFrame(result, columns=columns)
+
+
+def reliability_conference_summary(data: pd.DataFrame, metric: str,
+                                   min_rows: int = 50, min_teams: int = 5) -> pd.DataFrame:
+    """Compare within-label historical relationships; cannot infer causality."""
+    columns = ["Current conference label", "Distinct teams", "Team-game rows",
+               "Rows with statistic", "Coverage %", "Pearson r"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    feature, outcome, _ = RELIABILITY_METRICS[metric]
+    labeled = data.copy()
+    if "current_conference" not in labeled:
+        labeled["current_conference"] = "Unknown"
+    labeled["current_conference"] = labeled["current_conference"].fillna("Unknown").replace("", "Unknown")
+    result = []
+    for conference, group in labeled.groupby("current_conference", sort=True):
+        distinct = int(group["team_id"].nunique())
+        if distinct < min_teams:
+            continue
+        available = int(group[[feature, outcome]].notna().all(axis=1).sum())
+        result.append({
+            "Current conference label": str(conference),
+            "Distinct teams": distinct,
+            "Team-game rows": len(group),
+            "Rows with statistic": available,
+            "Coverage %": round(100.0 * available / len(group), 1),
+            "Pearson r": reliability_pearson(group, feature, outcome, min_rows),
+        })
+    return pd.DataFrame(result, columns=columns).sort_values(
+        "Team-game rows", ascending=False).reset_index(drop=True)
+
+
+def reliability_sample_volatility(data: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Typical absolute change in a PRE-GAME statistic between successive days
+    with a team game. No same-day results or future snapshots enter the lag.
+    The sample-size band refers to the later of the two observations.
+    """
+    columns = ["Prior games band", "Sequential comparisons", "Distinct teams",
+               "Median |change|", "90th pct |change|"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    feature = RELIABILITY_METRICS[metric][0]
+    rows = data[["season", "team_id", "game_id", "game_date",
+                 "games_before", feature]].copy()
+    rows["game_date"] = pd.to_datetime(rows["game_date"], errors="coerce")
+    rows["games_before"] = pd.to_numeric(rows["games_before"], errors="coerce")
+    rows[feature] = pd.to_numeric(rows[feature], errors="coerce")
+    rows = rows.dropna(subset=["season", "team_id", "game_date", "games_before"])
+    rows = rows.sort_values(["season", "team_id", "game_date", "game_id"], kind="stable")
+    # Rare same-day doubleheaders use the same prior-day feature set. Retain
+    # only one pregame snapshot per team-day to prevent fake zero changes.
+    rows = rows.drop_duplicates(["season", "team_id", "game_date"], keep="first")
+    team = rows.groupby(["season", "team_id"], sort=False)
+    rows["previous_date"] = team["game_date"].shift(1)
+    rows["previous_games"] = team["games_before"].shift(1)
+    rows["previous_value"] = team[feature].shift(1)
+    rows = rows[
+        (rows["previous_date"].notna())
+        & (rows["game_date"] > rows["previous_date"])
+        & (rows["games_before"] > rows["previous_games"])
+        & (rows[feature].notna()) & (rows["previous_value"].notna())
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+    rows["absolute_change"] = (rows[feature] - rows["previous_value"]).abs()
+    rows["Prior games band"] = pd.cut(
+        rows["games_before"], bins=[0, 4, 9, 19, float("inf")],
+        labels=["1–4", "5–9", "10–19", "20+"], include_lowest=True
+    )
+    summary = rows.groupby("Prior games band", observed=True).agg(
+        comparisons=("absolute_change", "size"),
+        teams=("team_id", "nunique"),
+        median=("absolute_change", "median"),
+        percentile90=("absolute_change", lambda series: series.quantile(0.9)),
+    ).reset_index()
+    summary["Prior games band"] = summary["Prior games band"].astype(str)
+    return summary.rename(columns={"comparisons": "Sequential comparisons",
+                                   "teams": "Distinct teams",
+                                   "median": "Median |change|",
+                                   "percentile90": "90th pct |change|"})[columns].round(2)
+
+
+def reliability_feature_coverage(data: pd.DataFrame) -> pd.DataFrame:
+    """Missing-data audit by metric, after earlier-date ratings are masked."""
+    columns = ["Statistic", "Rows available", "Team-game rows", "Coverage %"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    results = []
+    for metric, (feature, _outcome, _description) in RELIABILITY_METRICS.items():
+        n = int(data[feature].notna().sum())
+        results.append({"Statistic": metric, "Rows available": n,
+                        "Team-game rows": len(data),
+                        "Coverage %": round(100.0 * n / len(data), 1)})
+    return pd.DataFrame(results, columns=columns)
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -2497,6 +2645,114 @@ elif page == "Statistical Feature Analysis":
                "ESPN games/box scores. This page reads data only. It does not modify "
                "Supabase or produce upcoming-matchup forecasts, picks, or wagering outputs.")
 
+
+
+elif page == "Statistical Reliability Report":
+    st.subheader("Statistical Reliability Report")
+    st.caption("Explore how stable earlier-date team metrics and their historical associations "
+               "are across seasons, sample sizes and conference labels. This is descriptive "
+               "reliability analysis, NOT a future-game forecast or model accuracy score.")
+    exists = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS available")
+    if exists.empty or not bool(exists.iloc[0]["available"]):
+        st.info("Run the Verify NCAA MBB Historical Pregame Data workflow first.")
+    else:
+        scope = st.radio("Historical data", ["Five completed seasons (2021–22 to 2025–26)",
+                                             "Selected ESPN season"], horizontal=True,
+                         key="reliability_scope")
+        from_year, to_year = ((2022, 2026) if scope.startswith("Five completed")
+                             else (season, season))
+        selected_metric = st.selectbox("Statistic to examine", list(RELIABILITY_METRICS),
+                                       key="reliability_metric")
+        raw = query(RELIABILITY_SQL, (from_year, to_year))
+        data = feature_analysis_prepare(raw, min_history=1)
+        if data.empty:
+            st.info("No completed D1 games with usable pregame records were found. "
+                    "Try another season or rerun the pregame-data workflow.")
+        else:
+            feature, target, target_name = RELIABILITY_METRICS[selected_metric]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Team-game observations", f"{len(data):,}")
+            c2.metric("Completed games represented", f"{data[['season','game_id']].drop_duplicates().shape[0]:,}")
+            c3.metric("Teams represented", f"{data['team_id'].nunique():,}")
+            if data["invalid_prior_rating"].any():
+                st.warning(f"{int(data['invalid_prior_rating'].sum()):,} observations had "
+                           "adjusted ratings without a strictly earlier date. "
+                           "Those ratings have been excluded from every result below.")
+            season_tab, sample_tab, conference_tab, coverage_tab = st.tabs([
+                "Year-by-year consistency", "By sample size", "Conference groups", "Coverage & exports"
+            ])
+            with season_tab:
+                st.markdown("#### Same historical relationship, different seasons")
+                st.caption("Pearson r compares **" + selected_metric + "** measured before "
+                           "a game with **" + target_name + "** from that completed game. "
+                           "Correlation is not causal evidence or a model's forecast accuracy.")
+                year_table = reliability_season_summary(data, selected_metric)
+                show_table(year_table.round(3))
+                chart_data = year_table.dropna(subset=["Pearson r"])
+                if not chart_data.empty:
+                    st.bar_chart(chart_data.set_index("Season")[["Pearson r"]])
+                    values = chart_data["Pearson r"]
+                    if len(values) >= 2:
+                        st.caption(f"Observed range of season correlations: "
+                                   f"{values.min():+.3f} to {values.max():+.3f}. "
+                                   "Changes in schedule quality and team composition "
+                                   "can influence this relationship.")
+                else:
+                    st.info("Insufficient data or variation to calculate correlations.")
+                st.download_button("Download season consistency (CSV)",
+                                   data=year_table.to_csv(index=False),
+                                   file_name=f"ncaa_reliability_seasons_{from_year}_{to_year}.csv",
+                                   mime="text/csv", key="reliability_season_csv")
+            with sample_tab:
+                st.markdown("#### How much do pregame statistics change with more games played?")
+                volatility = reliability_sample_volatility(data, selected_metric)
+                if volatility.empty:
+                    st.info("Insufficient sequential prior-game observations for this statistic.")
+                else:
+                    show_table(volatility)
+                    st.bar_chart(volatility.set_index("Prior games band")[["Median |change|", "90th pct |change|"]])
+                    st.download_button("Download sample-size variation (CSV)",
+                                       data=volatility.to_csv(index=False),
+                                       file_name=f"ncaa_reliability_sample_sizes_{from_year}_{to_year}.csv",
+                                       mime="text/csv", key="reliability_sample_csv")
+                st.caption("Each comparison uses consecutive observations from the SAME "
+                           "team and season, on strictly increasing dates. The difference "
+                           "is the absolute change in the pregame statistic, not the "
+                           "error of a prediction. Different bands may have different "
+                           "teams and opponents; 20+ games is not guaranteed to be most stable.")
+            with conference_tab:
+                st.markdown("#### Historical associations grouped by conference label")
+                conference = reliability_conference_summary(data, selected_metric)
+                if conference.empty:
+                    st.info("No conference group meets the minimum team count.")
+                else:
+                    show_table(conference.round(3))
+                    st.download_button("Download conference groups (CSV)",
+                                       data=conference.to_csv(index=False),
+                                       file_name=f"ncaa_reliability_conferences_{from_year}_{to_year}.csv",
+                                       mime="text/csv", key="reliability_conference_csv")
+                st.warning("Conference assignments come from the CURRENT ESPN teams "
+                           "table. Realignment means a school's current conference "
+                           "may not match its conference in older seasons. These are "
+                           "current-label groupings, not verified historical standings.")
+                st.caption("Correlations are omitted when a group has fewer than 50 "
+                           "complete observations or insufficient variation. Groups "
+                           "with fewer than five distinct teams are excluded.")
+            with coverage_tab:
+                st.markdown("#### Availability of pregame statistics")
+                coverage = reliability_feature_coverage(data)
+                show_table(coverage)
+                st.download_button("Download metric coverage (CSV)",
+                                   data=coverage.to_csv(index=False),
+                                   file_name=f"ncaa_reliability_coverage_{from_year}_{to_year}.csv",
+                                   mime="text/csv", key="reliability_coverage_csv")
+                st.caption("Only finished Division I games with consistent final scores "
+                           "and both teams' usable box scores are included. Each game "
+                           "contributes up to two team observations, which are not "
+                           "independent. Missing prior-date ratings are never filled "
+                           "with same-day or future data.")
+    st.caption("Read-only report; uses pregame_team_features, games and team_game_stats. "
+               "No Supabase migration, model training, picks or wagering actions.")
 
 elif page == "Advanced Matchup Comparison":
     st.subheader("Advanced Matchup Comparison")
