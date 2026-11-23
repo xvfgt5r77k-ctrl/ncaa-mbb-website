@@ -6,6 +6,7 @@ browser; data is read from PostgreSQL using parameterized, read-only queries.
 from __future__ import annotations
 
 import os
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -229,8 +230,34 @@ try:
     season_values = seasons["season"].astype(int).tolist()
     season = st.selectbox("Season (ESPN ending year)", season_values)
     latest_season = season_values[0]
-except Exception:
-    st.error("Cannot read cloud database yet. Confirm the database connection string and run the first import in GitHub Actions. Check deployment logs for details.")
+except Exception as exc:
+    # Log only a classified error category, not the raw exception: database
+    # exceptions can occasionally contain credential-bearing connection details.
+    detail = str(exc).lower()
+    if "password authentication failed" in detail or "authentication failed" in detail:
+        reason = "Supabase rejected the database username or password"
+    elif "could not translate host name" in detail or "failed to resolve host" in detail:
+        reason = "The database hostname in DATABASE_URL is malformed or unreachable"
+    elif "timeout" in detail or "timed out" in detail:
+        reason = "The database connection timed out"
+    elif "connection refused" in detail:
+        reason = "The database server refused the connection"
+    elif "permission denied" in detail:
+        reason = "Database user lacks permission to read the required table"
+    elif "relation" in detail and "does not exist" in detail:
+        reason = "A required database table does not exist"
+    elif "database_url" in detail or "connection string" in detail:
+        reason = "DATABASE_URL is missing or malformed"
+    elif "invalid" in detail and ("port" in detail or "dsn" in detail):
+        reason = "The PostgreSQL connection URL is malformed"
+    else:
+        reason = "An unexpected error occurred while reading the database"
+    logging.error("NCAA dashboard database read failed. Error type: %s. Reason: %s.",
+                  type(exc).__name__, reason)
+    st.error("Cannot read cloud database yet.")
+    st.warning(f"**Database diagnostic:** {reason}.")
+    st.caption("This diagnostic does not display your password, database URL, or other credentials. "
+               "If you change Streamlit secrets, save them and reboot the app.")
     st.stop()
 
 if page == "Game schedules":
