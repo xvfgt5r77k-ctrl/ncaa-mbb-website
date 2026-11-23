@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 import requests
 import streamlit as st
 
@@ -1406,12 +1407,127 @@ def reliability_feature_coverage(data: pd.DataFrame) -> pd.DataFrame:
                         "Coverage %": round(100.0 * n / len(data), 1)})
     return pd.DataFrame(results, columns=columns)
 
+
+# Historical mean-scoring benchmark audit. These outputs describe the errors of
+# an EXISTING, unfitted prior-games average, for games that have already ended.
+# No training, future-game scores, winner probabilities or wager outputs.
+def historical_error_prepare(raw: pd.DataFrame, min_history: int = 5) -> pd.DataFrame:
+    """Only completed D1 games with both sides' strictly prior-date scoring means.
+
+    FEATURE_ANALYSIS_SQL requires two consistent team box scores and final score;
+    feature_analysis_prepare excludes same-date/future adjusted ratings and
+    applies the >=min_history previous-game rule. Exclude incomplete paired
+    matchups rather than allowing one-sided games to change the error sample.
+    """
+    cols = ["season", "game_id", "game_date", "team_id", "team", "venue",
+            "games_before", "prior_ppg", "points", "signed_error", "absolute_error",
+            "squared_error", "history_band"]
+    if raw.empty:
+        return pd.DataFrame(columns=cols)
+    data = feature_analysis_prepare(raw, min_history=min_history)
+    if data.empty:
+        return pd.DataFrame(columns=cols)
+    data = data.dropna(subset=["season", "game_id", "team_id", "prior_ppg", "points"]).copy()
+    data = data[(data["prior_ppg"] >= 0) & (data["games_before"] >= min_history)]
+    if data.empty:
+        return pd.DataFrame(columns=cols)
+    # Exactly two DISTINCT teams/rows for the game. Excludes duplicated data.
+    pairs = data.groupby(["season", "game_id"], sort=False).agg(
+        rows=("team_id", "size"), teams=("team_id", "nunique")
+    ).reset_index()
+    pairs = pairs[(pairs["rows"] == 2) & (pairs["teams"] == 2)][["season", "game_id"]]
+    data = data.merge(pairs, on=["season", "game_id"], how="inner", validate="many_to_one")
+    if data.empty:
+        return pd.DataFrame(columns=cols)
+    data["signed_error"] = data["prior_ppg"] - data["points"]
+    data["absolute_error"] = data["signed_error"].abs()
+    data["squared_error"] = data["signed_error"] ** 2
+    data["history_band"] = pd.cut(data["games_before"],
+                                  bins=[min_history - 1, 9, 19, float("inf")],
+                                  labels=[f"{min_history}–9", "10–19", "20+"],
+                                  include_lowest=True)
+    return data[cols].sort_values(["season", "game_date", "game_id", "team_id"])
+
+
+def historical_error_summary(data: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    """Descriptive error estimates for completed games. Two scores per game."""
+    metric_cols = ["Games", "Team scores", "Mean actual score", "Mean earlier PPG",
+                   "MAE", "RMSE", "Bias", "Median abs. error", "P90 abs. error"]
+    columns = group_cols + metric_cols
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    out = []
+    grouped = data.groupby(group_cols, observed=True, dropna=False, sort=True)
+    for key, group in grouped:
+        keys = key if isinstance(key, tuple) else (key,)
+        mse = group["squared_error"].mean()
+        record = dict(zip(group_cols, keys))
+        record.update({
+            "Games": int(group[["season", "game_id"]].drop_duplicates().shape[0]),
+            "Team scores": int(len(group)),
+            "Mean actual score": round(float(group["points"].mean()), 2),
+            "Mean earlier PPG": round(float(group["prior_ppg"].mean()), 2),
+            "MAE": round(float(group["absolute_error"].mean()), 2),
+            "RMSE": round(float(np.sqrt(mse)), 2),
+            "Bias": round(float(group["signed_error"].mean()), 2),
+            "Median abs. error": round(float(group["absolute_error"].median()), 2),
+            "P90 abs. error": round(float(group["absolute_error"].quantile(.9)), 2),
+        })
+        out.append(record)
+    return pd.DataFrame(out, columns=columns)
+
+
+def historical_error_game_bootstrap(data: pd.DataFrame, samples: int = 250,
+                                    seed: int = 23) -> pd.DataFrame:
+    """Cluster bootstrap by game, not by team-score row.
+
+    Home and away scoring errors from the same game are correlated. Resampling
+    complete game clusters estimates uncertainty for that historic sample,
+    NOT an interval for future matches or an accuracy guarantee.
+    """
+    columns = ["season", "Games", "MAE 95% low", "MAE 95% high"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    rng = np.random.default_rng(seed)
+    results = []
+    for season, frame in data.groupby("season", sort=True):
+        games = frame.groupby("game_id").agg(total_absolute=("absolute_error", "sum"),
+                                             scores=("absolute_error", "size"))
+        n = len(games)
+        if n < 20 or samples < 20:
+            results.append({"season": int(season), "Games": n,
+                            "MAE 95% low": float("nan"), "MAE 95% high": float("nan")})
+            continue
+        total = games["total_absolute"].to_numpy(dtype=float)
+        count = games["scores"].to_numpy(dtype=float)
+        idx = rng.integers(0, n, size=(samples, n))
+        estimates = total[idx].sum(axis=1) / count[idx].sum(axis=1)
+        low, high = np.quantile(estimates, [.025, .975])
+        results.append({"season": int(season), "Games": n,
+                        "MAE 95% low": round(float(low), 2),
+                        "MAE 95% high": round(float(high), 2)})
+    return pd.DataFrame(results, columns=columns)
+
+
+def historical_error_bins(data: pd.DataFrame) -> pd.DataFrame:
+    """Counts of completed-game team scores within absolute-error ranges."""
+    columns = ["Absolute error (points)", "Team scores"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    bands = [-0.001, 3, 5, 8, 12, 16, 20, 30, float("inf")]
+    names = ["0–3", "3–5", "5–8", "8–12", "12–16", "16–20", "20–30", "30+"]
+    classes = pd.cut(data["absolute_error"], bins=bands, labels=names, include_lowest=True)
+    counts = classes.value_counts(sort=False)
+    return pd.DataFrame({"Absolute error (points)": names,
+                         "Team scores": [int(counts.get(k, 0)) for k in names]})
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -2753,6 +2869,130 @@ elif page == "Statistical Reliability Report":
                            "with same-day or future data.")
     st.caption("Read-only report; uses pregame_team_features, games and team_game_stats. "
                "No Supabase migration, model training, picks or wagering actions.")
+
+
+elif page == "Historical Scoring Accuracy":
+    st.subheader("Historical Scoring Accuracy — Independent Baseline Audit")
+    st.caption("Evaluate how far prior-game team scoring averages differed from actual "
+               "completed-game scores. This is a read-only retrospective report, "
+               "not a trained prediction model or a future-game forecasting service.")
+    table_check = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS ok")
+    if table_check.empty or not bool(table_check.iloc[0]["ok"]):
+        st.info("Run your existing 'Verify NCAA MBB Historical Pregame Data' "
+                "GitHub workflow before opening this page.")
+    else:
+        choice = st.selectbox("Historical evaluation scope", [
+            "All five historical seasons (2021–22 to 2025–26)",
+            "Development seasons (2021–22 to 2023–24)",
+            "Validation only (2024–25)",
+            "Final holdout only (2025–26)"
+        ], key="historical_error_scope")
+        window = {
+            "All five historical seasons (2021–22 to 2025–26)": (2022, 2026),
+            "Development seasons (2021–22 to 2023–24)": (2022, 2024),
+            "Validation only (2024–25)": (2025, 2025),
+            "Final holdout only (2025–26)": (2026, 2026)
+        }
+        start_year, end_year = window[choice]
+        past = query(FEATURE_ANALYSIS_SQL, (start_year, end_year))
+        if past.empty:
+            st.info("No completed Division I games with usable box scores in this season range.")
+        else:
+            errors = historical_error_prepare(past, min_history=5)
+            if errors.empty:
+                st.info("No games have TWO team records with at least five prior usable games "
+                        "and an earlier-date scoring average. Early-season games are excluded.")
+            else:
+                game_count = errors[["season", "game_id"]].drop_duplicates().shape[0]
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Completed games reviewed", f"{game_count:,}")
+                col2.metric("Team scores reviewed", f"{len(errors):,}")
+                col3.metric("Mean absolute error", f"{errors['absolute_error'].mean():.2f} pts")
+                col4.metric("90th-percentile error", f"{errors['absolute_error'].quantile(.9):.2f} pts")
+                st.caption("Both teams must have at least five usable PRIOR games. "
+                           "A scoring error = earlier team PPG − actual points scored. "
+                           "This sample is smaller than the full set of completed games. "
+                           "The two team scores from one game are not independent.")
+                annual_tab, distribution_tab, conditions_tab, methods_tab = st.tabs([
+                    "Accuracy by season", "Error distribution", "Venue & sample size", "Coverage & methods"
+                ])
+                with annual_tab:
+                    st.markdown("#### Accuracy of the unchanged historical scoring benchmark")
+                    annual = historical_error_summary(errors, ["season"])
+                    ci = historical_error_game_bootstrap(errors)
+                    annual = annual.merge(ci[["season", "MAE 95% low", "MAE 95% high"]],
+                                          on="season", how="left", validate="one_to_one")
+                    annual["Season"] = annual["season"].apply(historical_season_label)
+                    annual["Split"] = annual["season"].apply(
+                        lambda yr: "Development" if yr <= 2024 else
+                        "Validation" if yr == 2025 else "Final holdout")
+                    annual = annual.drop(columns=["season"])
+                    annual = annual[["Season", "Split"] + [c for c in annual.columns
+                                                if c not in ("Season", "Split")]]
+                    show_table(annual)
+                    st.bar_chart(annual.set_index("Season")[["MAE", "RMSE"]])
+                    st.caption("MAE and RMSE are in points per TEAM score; bias is "
+                               "earlier average minus final points (positive = overestimation). "
+                               "Confidence intervals resample complete game pairs, "
+                               "not individual teams. They describe historical sampling "
+                               "variability, not guaranteed performance on future games.")
+                    st.download_button("Download season error summary (CSV)",
+                                       data=annual.to_csv(index=False),
+                                       file_name=f"ncaa_scoring_errors_{start_year}_{end_year}.csv",
+                                       mime="text/csv", key="historical_error_annual_download")
+                with distribution_tab:
+                    st.markdown("#### How often was the past scoring average far from the final score?")
+                    bins = historical_error_bins(errors)
+                    st.bar_chart(bins.set_index("Absolute error (points)"))
+                    show_table(bins)
+                    st.caption("Ranges are in points, counted for individual team scores "
+                               "from completed historical games only. No modeled "
+                               "winner or confidence probabilities are shown.")
+                with conditions_tab:
+                    st.markdown("#### Descriptive differences by venue and previous games")
+                    st.caption("These are not matched experiments: location, opponent "
+                               "quality and the part of the season can all differ.")
+                    venue = historical_error_summary(errors, ["venue"])
+                    show_table(venue)
+                    bands = historical_error_summary(errors, ["history_band"])
+                    bands["history_band"] = bands["history_band"].astype(str)
+                    show_table(bands)
+                    st.download_button("Download grouped historical errors (CSV)",
+                                       data=venue.to_csv(index=False),
+                                       file_name="ncaa_scoring_errors_by_venue.csv",
+                                       mime="text/csv", key="historical_error_venue_download")
+                with methods_tab:
+                    st.markdown("#### What this does and does not measure")
+                    st.write("The score benchmark uses each team's previous usable-game "
+                             "scoring mean, not its season-ending mean. Same-day games are "
+                             "not included, and no values are learned from the validation "
+                             "or final holdout seasons.")
+                    st.write("Only completed Division I-versus-Division I games with "
+                             "matching scores, two usable box scores, and two pregame "
+                             "history records are included. An early game with too few "
+                             "previous results does not enter the error sample.")
+                    st.write("The holdout seasons here are separate historical reporting "
+                             "periods for an UNFITTED scoring benchmark, not tests of "
+                             "a newly trained winner or matchup prediction model.")
+                    audit = query("SELECT to_regclass('public.historical_coverage_audit') "
+                                  "IS NOT NULL AS ok")
+                    if not audit.empty and bool(audit.iloc[0]["ok"]):
+                        counts = query("SELECT season, completed_games, usable_stat_games "
+                                       "FROM historical_coverage_audit "
+                                       "WHERE season BETWEEN %s AND %s ORDER BY season",
+                                       (start_year, end_year))
+                        if not counts.empty:
+                            paired = errors.groupby("season")["game_id"].nunique()
+                            counts["Both sides with 5+ prior games"] = (
+                                counts["season"].map(paired).fillna(0).astype(int))
+                            counts["Season"] = counts["season"].apply(historical_season_label)
+                            counts = counts.rename(columns={
+                                "completed_games": "All completed game records",
+                                "usable_stat_games": "Games with usable two-sided stats"
+                            }).drop(columns=["season"])
+                            show_table(counts)
+                    st.caption("No model training, future-game projections, win probabilities, "
+                               "or automated wagering functions are included.")
 
 elif page == "Advanced Matchup Comparison":
     st.subheader("Advanced Matchup Comparison")
