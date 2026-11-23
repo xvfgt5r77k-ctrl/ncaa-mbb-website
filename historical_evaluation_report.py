@@ -114,7 +114,72 @@ def rows_from_archive(archive: Path, key: str, manifest: dict):
         raise ValueError(f"Row count mismatch in {key}.csv: {n} versus {expected['rows']}")
 
 
-def report_tables(manifest: dict, coverage_rows: list[dict], baseline_rows: list[dict], features: list[dict]):
+def _true(value) -> bool:
+    """Interpret booleans serialized from PostgreSQL into the frozen CSV."""
+    return str(value).strip().lower() in ("true", "t", "1", "yes")
+
+
+def _valid_d1_boxscore(game: dict, home: dict | None, away: dict | None) -> bool:
+    """Match the original pregame_quality._usable criteria for one completed game."""
+    if not home or not away or _date(game.get("game_date")) is None:
+        return False
+    if game.get("home_team_id") == game.get("away_team_id"):
+        return False
+    for score, box in ((game.get("home_score"), home.get("points")),
+                       (game.get("away_score"), away.get("points"))):
+        a, b = _float(score), _float(box)
+        if a is None or b is None or a < 0 or b < 0 or a != b:
+            return False
+    return all(_float(s.get("possessions")) is not None
+               and _float(s.get("possessions")) > 0 for s in (home, away))
+
+
+def d1_coverage_from_archive(archive: Path, manifest: dict) -> dict[int, dict]:
+    """Recount completed D1 vs D1 matchups and their usable box scores.
+
+    The stored historical_coverage_audit.usable_stat_games includes non-D1
+    games, so it must NEVER be divided by its D1-only d1_matchups column.
+    """
+    needed = {"games", "teams", "team_game_stats"}
+    if not needed <= manifest["files"].keys():
+        raise ValueError("Frozen export lacks games/teams/team_game_stats; cannot calculate comparable D1 coverage")
+    is_d1 = {}
+    for row in rows_from_archive(archive, "teams", manifest):
+        team_id = row["team_id"]
+        if team_id in is_d1:
+            raise ValueError(f"Duplicate exported team ID {team_id}")
+        is_d1[team_id] = _true(row["is_d1"])
+    eligible = {}
+    counts = defaultdict(lambda: {"d1_matchups": 0, "usable_d1_games": 0})
+    for g in rows_from_archive(archive, "games", manifest):
+        if not _true(g.get("completed")):
+            continue
+        if not (is_d1.get(g["home_team_id"], False) and is_d1.get(g["away_team_id"], False)):
+            continue
+        year = _int(g.get("season"))
+        if year is None:
+            raise ValueError("Invalid season in exported games")
+        counts[year]["d1_matchups"] += 1
+        if g["game_id"] in eligible:
+            raise ValueError(f"Duplicate exported game ID {g['game_id']}")
+        eligible[g["game_id"]] = g
+    stat_index = defaultdict(dict)
+    for s in rows_from_archive(archive, "team_game_stats", manifest):
+        game = eligible.get(s["game_id"])
+        if game is None or s["team_id"] not in (game["home_team_id"], game["away_team_id"]):
+            continue
+        indexed = stat_index[s["game_id"]]
+        if s["team_id"] in indexed:
+            raise ValueError(f"Duplicate box score for {s['game_id']} / {s['team_id']}")
+        indexed[s["team_id"]] = s
+    for game_id, g in eligible.items():
+        scores = stat_index.get(game_id, {})
+        if _valid_d1_boxscore(g, scores.get(g["home_team_id"]), scores.get(g["away_team_id"])):
+            counts[int(g["season"])]["usable_d1_games"] += 1
+    return dict(counts)
+
+
+def report_tables(manifest: dict, coverage_rows: list[dict], baseline_rows: list[dict], features: list[dict], d1_coverage: dict[int, dict] | None = None):
     start, end = [int(y) for y in manifest["season_range_inclusive"]]
     years = list(range(start, end + 1))
     expected = set(years)
@@ -171,16 +236,23 @@ def report_tables(manifest: dict, coverage_rows: list[dict], baseline_rows: list
         if f["pregame_rows"] == 0:
             flags.append(f"No pregame feature rows for season {year}.")
         den = _int(c.get("d1_matchups")) if c else None
-        usable = _int(c.get("usable_stat_games")) if c else None
+        all_usable = _int(c.get("usable_stat_games")) if c else None
+        comparable = d1_coverage.get(year) if d1_coverage is not None else None
+        usable = _int(comparable.get("usable_d1_games")) if comparable else None
+        if d1_coverage is not None and comparable is None:
+            flags.append(f"Season {year}: no D1 games in the frozen archive.")
+        if comparable and _int(comparable.get("d1_matchups")) != den:
+            flags.append(f"Season {year}: archived D1 matchup count disagrees with stored audit.")
         mismatches = _int(c.get("score_mismatches")) if c else None
         possessions = _int(c.get("incomplete_possessions")) if c else None
         pct = _pct(usable, den)
         coverage.append({"Season": f"{year-1}–{str(year)[-2:]}", "ESPN season": year,
-                         "D1 completed matchups": den, "Usable games": usable,
-                         "Usable %": pct, "Score mismatches": mismatches,
-                         "Invalid possessions": possessions})
-        if pct is None or pct < 95:
-            flags.append(f"Season {year}: usable game coverage {pct if pct is not None else 'unavailable'}% (<95% review threshold).")
+                         "D1 completed matchups": den, "Usable D1 games": usable,
+                         "D1 usable %": pct, "All usable completed games": all_usable,
+                         "All-game score mismatches": mismatches,
+                         "All-game invalid possessions": possessions})
+        if pct is None or pct < 95 or pct > 100:
+            flags.append(f"Season {year}: comparable D1 coverage {pct if pct is not None else 'unavailable'}%; expected 95–100%.")
         if mismatches is None or mismatches > 0:
             flags.append(f"Season {year}: score mismatches {mismatches if mismatches is not None else 'unavailable'}.")
         if possessions is None or possessions > 0:
@@ -288,6 +360,7 @@ def write_report(summary: dict, output_dir: Path):
     md.extend([f"- {entry}\n" for entry in summary["flags"]] or ["No flags under the stated descriptive thresholds. This is not a guarantee of full coverage or model reliability.\n"])
     md.append("\n## Interpretation and limitations\n")
     md.extend(["- All CSV SHA-256 checksums and the manifest content ID were verified before reporting.\n",
+               "- D1 usable coverage counts only completed matchups between two D1 teams, with both valid box scores and possessions; all-game exceptions use a wider set of games.\n",
                "- Canceled and postponed records are not classified as missing completed games.\n",
                "- Historical adjusted team snapshots are end-of-day; this report checks only earlier-dated ratings stored in pregame features.\n",
                "- Stored coverage audits use current Division I flags, which may not match earlier-season membership.\n",
@@ -299,7 +372,7 @@ def write_report(summary: dict, output_dir: Path):
     head = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NCAA MBB Historical Evaluation</title><style>body{font-family:system-ui,Arial,sans-serif;max-width:1100px;margin:32px auto;padding:0 18px;background:#fafafa;color:#1d2939}h1{margin-bottom:5px}p{line-height:1.6}.meta{color:#475467}.wrap{overflow:auto;background:white;border:1px solid #ddd;border-radius:8px;margin:14px 0 25px}table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}th,td{border-bottom:1px solid #e7e7e7;padding:10px 12px;text-align:left}th{background:#f2f4f7}section{margin-top:32px}.review{background:#fff7ed;padding:14px 18px;border:1px solid #fed7aa;border-radius:8px}.ok{background:#f1f5f9;padding:14px 18px;border-radius:8px}li{margin-bottom:5px}@media print{body{background:white;margin:0}.wrap{break-inside:avoid}}</style></head><body>"""
     doc = [head, "<h1>NCAA MBB — Historical Evaluation</h1>",
            f"<p class='meta'>Frozen dataset ID: <code>{html_escape(summary['content_id'])}</code> · Created {html_escape(str(created))}</p>",
-           "<p>Retrospective data quality and scoring-baseline analysis. Not a trained forecast model, future-game prediction, or betting tool.</p>",
+           "<p>Retrospective data quality and scoring-baseline analysis. D1 usable percentages use matched D1-only numerators and denominators. All-game exceptions are shown separately. Not a trained forecast model, future-game prediction, or betting tool.</p>",
            f"<div class={'review' if summary['flags'] else 'ok'}><strong>{html_escape(status)}</strong><p>Thresholds are diagnostics, not guarantees of completeness.</p></div>"]
     for heading, key in tables:
         doc.extend([f"<section><h2>{html_escape(heading)}</h2><div class='wrap'>", html_table(summary[key]), "</div></section>"])
@@ -326,7 +399,8 @@ def generate(archive: Path, output_dir: Path):
     coverage = list(rows_from_archive(archive, "historical_coverage_audit", manifest))
     baseline = list(rows_from_archive(archive, "historical_score_baseline_audit", manifest))
     features = list(rows_from_archive(archive, "pregame_team_features", manifest))
-    result = report_tables(manifest, coverage, baseline, features)
+    d1_coverage = d1_coverage_from_archive(archive, manifest)
+    result = report_tables(manifest, coverage, baseline, features, d1_coverage)
     write_report(result, output_dir)
     print(f"Verified dataset ID: {result['content_id']}")
     print(f"Seasons: {result['seasons'][0]}–{result['seasons'][-1]}")
