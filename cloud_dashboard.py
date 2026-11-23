@@ -78,6 +78,49 @@ ORDER BY net_eff DESC, name ASC
 """
 
 
+# Season averages use the completed games already imported by GitHub Actions.
+# Numeric playing time excludes ESPN DNP/DND rows from games played and averages.
+# Shooting percentages use total makes / total attempts, not an average of game percentages.
+PLAYER_SEASON_AVERAGES_QUERY = """
+WITH appearances AS (
+    SELECT t.team_id, t.name AS school, p.player_id, p.name AS player,
+           p.position,
+           CASE
+             WHEN BTRIM(s.minutes) ~ '^[0-9]+:[0-9]{1,2}$'
+               THEN SPLIT_PART(BTRIM(s.minutes), ':', 1)::numeric
+                    + SPLIT_PART(BTRIM(s.minutes), ':', 2)::numeric / 60.0
+             WHEN BTRIM(s.minutes) ~ '^[0-9]+([.][0-9]+)?$'
+               THEN BTRIM(s.minutes)::numeric
+             ELSE NULL
+           END AS minutes_played,
+           s.points, s.rebounds, s.assists, s.steals, s.blocks, s.turnovers,
+           s.fg_m, s.fg_a, s.three_m, s.three_a, s.ft_m, s.ft_a
+    FROM player_game_stats s
+    JOIN games g ON g.game_id = s.game_id
+    JOIN players p ON p.player_id = s.player_id
+    JOIN teams t ON t.team_id = s.team_id
+    WHERE g.season = %s AND g.completed = 1 AND t.is_d1 = 1
+      AND (BTRIM(s.minutes) ~ '^[0-9]+:[0-9]{1,2}$'
+           OR BTRIM(s.minutes) ~ '^[0-9]+([.][0-9]+)?$')
+)
+SELECT school, team_id, player_id, player, position,
+       COUNT(*) AS gp,
+       ROUND(AVG(minutes_played), 1)::double precision AS mpg,
+       ROUND(AVG(COALESCE(points, 0)), 1)::double precision AS ppg,
+       ROUND(AVG(COALESCE(rebounds, 0)), 1)::double precision AS rpg,
+       ROUND(AVG(COALESCE(assists, 0)), 1)::double precision AS apg,
+       ROUND(AVG(COALESCE(steals, 0)), 1)::double precision AS spg,
+       ROUND(AVG(COALESCE(blocks, 0)), 1)::double precision AS bpg,
+       ROUND(AVG(COALESCE(turnovers, 0)), 1)::double precision AS topg,
+       ROUND(100.0 * COALESCE(SUM(fg_m), 0) / NULLIF(SUM(fg_a), 0), 1)::double precision AS fg_pct,
+       ROUND(100.0 * COALESCE(SUM(three_m), 0) / NULLIF(SUM(three_a), 0), 1)::double precision AS three_pct,
+       ROUND(100.0 * COALESCE(SUM(ft_m), 0) / NULLIF(SUM(ft_a), 0), 1)::double precision AS ft_pct
+FROM appearances
+GROUP BY school, team_id, player_id, player, position
+ORDER BY LOWER(school), ppg DESC, LOWER(player)
+"""
+
+
 def show_table(frame: pd.DataFrame, columns: list[str] | None = None):
     st.dataframe(frame[columns] if columns else frame, use_container_width=True,
                  hide_index=True)
@@ -317,7 +360,7 @@ st.caption("Division I • ESPN game statistics • unadjusted, possession-based
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player box scores", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -548,34 +591,57 @@ elif page == "Team explorer":
             graph.columns = ["Offensive efficiency", "Defensive efficiency"]
             st.line_chart(graph)
 
-elif page == "Player box scores":
-    st.subheader("Player box scores")
-    games = query("""
-        SELECT g.game_id,g.game_date,a.name AS away,h.name AS home
-        FROM games g JOIN teams a ON a.team_id=g.away_team_id
-        JOIN teams h ON h.team_id=g.home_team_id
-        WHERE g.season=%s AND g.completed=1
-        ORDER BY g.game_date DESC,g.start_time_utc DESC
-    """, (season,))
-    if games.empty:
-        st.info("No finished games in the database yet.")
+elif page == "Player season averages":
+    st.subheader("Player season averages")
+    st.caption("Season-to-date NCAA Division I men's basketball averages from imported completed "
+               "games. Sorted alphabetically by school, then by points per game within each "
+               "school. DNP entries are excluded. Shooting percentages are based on total "
+               "made / attempted shots.")
+    averages = query(PLAYER_SEASON_AVERAGES_QUERY, (season,))
+    if averages.empty:
+        st.info("No player appearances are available for this season. "
+                "Make sure the season has been imported in GitHub Actions.")
     else:
-        games["label"] = games["game_date"] + " • " + games["away"] + " @ " + games["home"] + " (" + games["game_id"] + ")"
-        label = st.selectbox("Choose a game", games["label"].tolist())
-        game_id = games.loc[games["label"]==label, "game_id"].iloc[0]
-        box = query("""
-            SELECT t.name AS team, p.name AS player,s.starter,s.minutes,s.points,s.rebounds,
-                   s.assists,s.steals,s.blocks,s.turnovers,s.fg_m,s.fg_a,
-                   s.three_m,s.three_a,s.ft_m,s.ft_a
-            FROM player_game_stats s JOIN players p ON p.player_id=s.player_id
-            JOIN teams t ON t.team_id=s.team_id
-            WHERE s.game_id=%s ORDER BY t.name,s.points DESC
-        """, (game_id,))
-        if box.empty:
-            st.info("No player box-score records for this game yet.")
+        school_options = ["All schools"] + sorted(averages["school"].dropna().unique().tolist(),
+                                                  key=str.casefold)
+        school_col, player_col, gp_col = st.columns([2, 2, 1])
+        with school_col:
+            school = st.selectbox("School", school_options)
+        with player_col:
+            player_search = st.text_input("Find a player", placeholder="Search by player name")
+        with gp_col:
+            minimum_gp = st.number_input("Minimum GP", min_value=1,
+                                         max_value=max(1, int(averages["gp"].max())),
+                                         value=1, step=1)
+        filtered = averages
+        if school != "All schools":
+            filtered = filtered.loc[filtered["school"] == school]
+        if player_search:
+            filtered = filtered.loc[filtered["player"].str.contains(
+                player_search, case=False, regex=False, na=False)]
+        filtered = filtered.loc[filtered["gp"] >= minimum_gp]
+        filtered = filtered.sort_values(["school", "ppg", "player"],
+                                        ascending=[True, False, True],
+                                        key=None, kind="stable")
+        st.caption(f"{len(filtered):,} players shown across "
+                   f"{filtered['school'].nunique():,} schools. "
+                   "GP = games played; MPG = minutes; PPG = points; RPG = rebounds; "
+                   "APG = assists; SPG = steals; BPG = blocks; TOPG = turnovers.")
+        if filtered.empty:
+            st.info("No players match your selected filters.")
         else:
-            show_table(box)
-            st.download_button("Download box score (CSV)", box.to_csv(index=False), "boxscore.csv", "text/csv")
+            renamed = filtered.rename(columns={
+                "school": "School", "player": "Player", "position": "Pos",
+                "gp": "GP", "mpg": "MPG", "ppg": "PPG", "rpg": "RPG",
+                "apg": "APG", "spg": "SPG", "bpg": "BPG", "topg": "TOPG",
+                "fg_pct": "FG%", "three_pct": "3P%", "ft_pct": "FT%",
+            })
+            columns = ["School", "Player", "Pos", "GP", "MPG", "PPG", "RPG",
+                       "APG", "SPG", "BPG", "TOPG", "FG%", "3P%", "FT%"]
+            table = renamed[columns]
+            show_table(table)
+            st.download_button("Download season averages (CSV)", table.to_csv(index=False),
+                               f"ncaa_player_season_averages_{season}.csv", "text/csv")
 
 elif page == "Injuries":
     st.subheader("Injury reports")
