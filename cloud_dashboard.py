@@ -1150,12 +1150,120 @@ def advanced_matchup_recent_table(history: pd.DataFrame, n: int) -> pd.DataFrame
         "Possessions": recent["possessions"].round(1).to_numpy(),
     }).reset_index(drop=True)
 
+
+
+# Historical Pregame Replay: review ONLY finished games using strictly pre-date
+# features stored in pregame_team_features. The final score is shown separately.
+# This never estimates outcomes for future games and never uses same-day updates.
+PREGAME_REPLAY_TEAMS_SQL = """
+SELECT DISTINCT t.team_id, t.name
+FROM pregame_team_features f
+JOIN games g ON g.game_id=f.game_id AND g.season=f.season
+JOIN teams t ON t.team_id=f.team_id AND t.is_d1=1
+WHERE f.season=%s AND g.completed=1
+ORDER BY t.name
+"""
+
+PREGAME_REPLAY_GAMES_SQL = """
+SELECT g.game_id, g.game_date, g.home_team_id, g.away_team_id,
+       g.home_score, g.away_score, g.neutral_site,
+       h.name AS home_name, a.name AS away_name,
+       h.logo_url AS home_logo, a.logo_url AS away_logo
+FROM games g
+JOIN teams h ON h.team_id=g.home_team_id AND h.is_d1=1
+JOIN teams a ON a.team_id=g.away_team_id AND a.is_d1=1
+JOIN pregame_team_features hf ON hf.game_id=g.game_id
+     AND hf.season=g.season AND hf.team_id=g.home_team_id
+JOIN pregame_team_features af ON af.game_id=g.game_id
+     AND af.season=g.season AND af.team_id=g.away_team_id
+WHERE g.season=%s AND g.completed=1
+  AND (g.home_team_id=%s OR g.away_team_id=%s)
+  AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+ORDER BY g.game_date DESC,g.game_id DESC
+"""
+
+PREGAME_REPLAY_FEATURES_SQL = """
+SELECT team_id, opponent_id, games_before, avg_points_for, avg_points_against,
+       avg_possessions, raw_offense, raw_defense, raw_net, recent_five_margin,
+       rest_days, adjusted_net_before, opponent_sos_before, rating_snapshot_date,
+       game_date, generated_at
+FROM pregame_team_features
+WHERE game_id=%s AND season=%s
+"""
+
+
+def pregame_replay_game_label(game: dict, chosen_team: str) -> str:
+    """Select a historical game without including its result in the selector."""
+    is_home = str(game['home_team_id']) == str(chosen_team)
+    opponent = str(game['away_name'] if is_home else game['home_name'])
+    venue = ('Neutral' if str(game.get('neutral_site')) in ('1','True','true')
+             else 'Home' if is_home else 'Away')
+    date_string = str(game['game_date'])[:10]
+    return f'{date_string} · {venue} vs {opponent}'
+
+
+def pregame_replay_prepare(rows: pd.DataFrame, game_day: str) -> pd.DataFrame:
+    """Mask ratings when their source is not strictly before the game date."""
+    if rows.empty:
+        return rows.copy()
+    cleaned = rows.copy()
+    match_day = pd.to_datetime(game_day, errors='coerce')
+    row_day = pd.to_datetime(cleaned['game_date'], errors='coerce')
+    snapshot_day = pd.to_datetime(cleaned['rating_snapshot_date'], errors='coerce')
+    is_prior = (pd.notna(match_day) & (row_day == match_day)
+                & snapshot_day.notna() & (snapshot_day < match_day))
+    # The source importer already writes pre-date features; this is extra
+    # defense against an incorrect/future rating being presented as historical.
+    cleaned['rating_is_prior'] = is_prior
+    cleaned.loc[~is_prior, ['adjusted_net_before','opponent_sos_before']] = float('nan')
+    return cleaned
+
+
+def pregame_replay_table(rows: pd.DataFrame, home_id: str, away_id: str) -> pd.DataFrame:
+    """Aligned *prior-only* team stats for one finished historical game."""
+    fields = [
+        ('Games played before game', 'games_before', False),
+        ('Prior points per game', 'avg_points_for', True),
+        ('Prior points allowed per game', 'avg_points_against', True),
+        ('Prior possessions per game', 'avg_possessions', True),
+        ('Prior offense / 100 possessions', 'raw_offense', True),
+        ('Prior defense / 100 possessions', 'raw_defense', True),
+        ('Prior raw net / 100 possessions', 'raw_net', True),
+        ('Prior five-game average margin', 'recent_five_margin', True),
+        ('Rest days before game', 'rest_days', False),
+        ('Prior adjusted net efficiency', 'adjusted_net_before', True),
+        ('Prior opponent strength of schedule', 'opponent_sos_before', True),
+        ('Adjusted rating snapshot date', 'rating_snapshot_date', False),
+    ]
+    if rows.empty:
+        return pd.DataFrame(columns=['Statistic','Home','Away'])
+    indexed = (rows.drop_duplicates(subset=['team_id']).assign(
+        _team_key=lambda x:x['team_id'].astype(str)).set_index('_team_key'))
+    def get(team_id, col, numeric):
+        key = str(team_id)
+        if key not in indexed.index:
+            return '—'
+        if col == 'rating_snapshot_date' and not bool(indexed.loc[key,'rating_is_prior']):
+            return '—'
+        value = indexed.loc[key,col]
+        if value is None or pd.isna(value):
+            return '—'
+        if numeric:
+            return f'{float(value):.1f}'
+        if col in ('games_before','rest_days'):
+            return str(int(float(value)))
+        return str(value)[:10] if col == 'rating_snapshot_date' else str(value)
+    return pd.DataFrame([{'Statistic':title,
+                          'Home':get(home_id,col,numeric),
+                          'Away':get(away_id,col,numeric)}
+                         for title,col,numeric in fields])
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Advanced Matchup Comparison", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -2495,6 +2603,86 @@ elif page == "Advanced Matchup Comparison":
                         show_table(advanced_matchup_recent_table(meetings, len(meetings)))
                     st.caption("This is a record of games already played, "
                                "not a prediction for a future matchup.")
+
+
+elif page == "Historical Pregame Replay":
+    st.subheader("Historical Pregame Matchup Replay")
+    st.caption("Select a game that has already finished. Compare only the team statistics "
+               "recorded before its calendar date, then inspect the actual result "
+               "in a separate tab. No future-game predictions or picks are generated.")
+    ready = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS available")
+    if ready.empty or not bool(ready.iloc[0]['available']):
+        st.info("Run your existing Verify NCAA MBB Historical Pregame Data workflow first.")
+    else:
+        eligible = query(PREGAME_REPLAY_TEAMS_SQL, (season,))
+        if eligible.empty:
+            st.info("No completed Division I games with pregame features were found "
+                    "for this season. Choose an imported historical season and refresh.")
+        else:
+            label_map = dict(zip(eligible['team_id'].astype(str), eligible['name'].astype(str)))
+            options = list(label_map)
+            selected_team = st.selectbox('Choose a team', options,
+                                         format_func=lambda team: label_map[team],
+                                         key='pregame_replay_team')
+            fixtures = query(PREGAME_REPLAY_GAMES_SQL,
+                             (season,selected_team,selected_team))
+            if fixtures.empty:
+                st.info("This team has no finished games with both pregame rows "
+                        "in the chosen season.")
+            else:
+                records = fixtures.to_dict('records')
+                by_id = {str(g['game_id']):g for g in records}
+                chosen_game = st.selectbox('Choose a completed matchup',list(by_id),
+                    format_func=lambda game_id: pregame_replay_game_label(by_id[game_id], selected_team),
+                    key='pregame_replay_game')
+                game = by_id[str(chosen_game)]
+                home_id, away_id = str(game['home_team_id']),str(game['away_team_id'])
+                feats = query(PREGAME_REPLAY_FEATURES_SQL, (chosen_game,season))
+                feats = pregame_replay_prepare(feats,str(game['game_date']))
+                home_ok = home_id in feats['team_id'].astype(str).values if not feats.empty else False
+                away_ok = away_id in feats['team_id'].astype(str).values if not feats.empty else False
+                if not (home_ok and away_ok):
+                    st.warning('One or both pregame team rows are missing. Refresh the historical '
+                               'pregame workflow before trusting this comparison.')
+                else:
+                    st.markdown('#### Teams on game day')
+                    first,second = st.columns(2)
+                    with first:
+                        st.markdown('<div class="mbb-team-card">'+team_badge(
+                            game['home_name'],home_id,game['home_logo'],{},None)+
+                            '</div>',unsafe_allow_html=True)
+                        st.caption('Home team' + (' · neutral venue' if int(game['neutral_site'] or 0)==1 else ''))
+                    with second:
+                        st.markdown('<div class="mbb-team-card">'+team_badge(
+                            game['away_name'],away_id,game['away_logo'],{},None)+
+                            '</div>',unsafe_allow_html=True)
+                        st.caption('Away team' + (' · neutral venue' if int(game['neutral_site'] or 0)==1 else ''))
+                    before_tab,after_tab = st.tabs(['📊 Before the game','🏁 Actual final result'])
+                    with before_tab:
+                        st.markdown('#### Statistics available before the matchup')
+                        table = pregame_replay_table(feats,home_id,away_id)
+                        show_table(table)
+                        st.download_button('Download pregame matchup statistics (CSV)',
+                            data=table.to_csv(index=False),
+                            file_name=f'pregame_replay_{season}_{chosen_game}.csv',
+                            mime='text/csv',key='pregame_replay_download')
+                        st.caption('Pregame features exclude all games on this matchup date. '
+                                   'Adjusted ratings without a strictly earlier snapshot are blank; '
+                                   'missing early-season history is not filled with future data. '
+                                   'Historical AP rankings are omitted because the stored latest '
+                                   'season poll is not a game-day AP poll.')
+                    with after_tab:
+                        st.markdown('#### Recorded final score')
+                        sc1,sc2 = st.columns(2)
+                        with sc1:
+                            st.metric(str(game['home_name']),
+                                      str(int(game['home_score'])))
+                        with sc2:
+                            st.metric(str(game['away_name']),
+                                      str(int(game['away_score'])))
+                        st.caption('Game date: '+str(game['game_date'])[:10]+
+                                   '. Actual final scores are shown only for retrospective review; '
+                                   'they are not included in the pregame statistics table.')
 
 elif page == "Injuries":
     st.subheader("Official conference player availability")
