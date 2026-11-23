@@ -1,0 +1,13 @@
+NCAA MEN'S BASKETBALL DATABASE — CLOUD WEBSITE VERSION
+
+You can access this website on any device once you publish it online.
+Your home computer can be turned off at night.
+
+FIRST: Open README.md and follow the six numbered steps.
+
+Services: GitHub (code + automatic updates), Supabase (persistent database),
+Streamlit Community Cloud (public/private web app hosting).
+
+Your app is NOT online yet until you connect these accounts and deploy.
+ESPN credentials are not needed. RotoWire injury integration is not active.
+NEVER share your Supabase DATABASE_URL, since it contains your password.
