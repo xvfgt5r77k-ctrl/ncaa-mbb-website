@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -11,6 +12,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 API_ROOT = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball"
+CORE_ROOT = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/mens-college-basketball"
+LOG = logging.getLogger(__name__)
 CENTRAL = ZoneInfo("America/Chicago")
 
 
@@ -68,8 +71,119 @@ class ESPN:
             raise ValueError(f"ESPN returned unexpected data for {path}")
         return data
 
+    def get_core(self, path, params=None):
+        """ESPN core-v2 API used for season-specific conference memberships."""
+        response = self.session.get(f"{CORE_ROOT}/{path}", params=params, timeout=25)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError(f"Unexpected ESPN core response for {path}")
+        return payload
+
+    @staticmethod
+    def _ref_id(ref, kind):
+        """Read ESPN IDs from core-v2 $ref URLs without following each reference."""
+        if not isinstance(ref, str):
+            return None
+        match = re.search(rf"/{kind}/(\d+)(?:[/?#]|$)", ref)
+        return match.group(1) if match else None
+
+    def _core_refs(self, path):
+        """Read all pages of a core-v2 collection (usually just one page)."""
+        page = 1
+        while True:
+            payload = self.get_core(path, {"limit": 200, "page": page, "lang": "en", "region": "us"})
+            for item in payload.get("items") or []:
+                if isinstance(item, dict):
+                    ref = item.get("$ref") or item.get("href")
+                    if ref:
+                        yield ref
+            pages = (payload.get("pageCount") or 1)
+            if page >= int(pages):
+                break
+            page += 1
+            if page > 25:
+                raise ValueError("Unexpectedly large ESPN core collection")
+
+    def conference_memberships(self, season):
+        """Map ESPN team IDs to conference names for the specified NCAA season.
+
+        The flat site /teams response doesn't reliably include a conference.
+        We combine ESPN's conference-name list with season-specific core-v2
+        group memberships. This does not guess from a team's opponents.
+        """
+        names_payload = self.get("scoreboard/conferences", {"seasontype": 2})
+        names = {}
+        for item in names_payload.get("conferences") or []:
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("groupId") or item.get("id")
+            name = item.get("name") or item.get("shortName")
+            if group_id is not None and name:
+                names[str(group_id)] = str(name).strip()
+        if not names:
+            raise ValueError("ESPN conference-name list was empty")
+
+        root = f"seasons/{int(season)}/types/2/groups"
+        conference_ids = [
+            self._ref_id(ref, "groups")
+            for ref in self._core_refs(f"{root}/50/children")
+        ]
+        conference_ids = list(dict.fromkeys(cid for cid in conference_ids if cid and cid != "50"))
+        if not conference_ids:
+            raise ValueError(f"No ESPN conferences returned for season {season}")
+
+        mapping = {}
+        failures = []
+        for group_id in conference_ids:
+            name = names.get(group_id)
+            if not name:
+                failures.append(f"{group_id}: conference name missing")
+                continue
+            try:
+                for ref in self._core_refs(f"{root}/{group_id}/teams"):
+                    team_id = self._ref_id(ref, "teams")
+                    if team_id:
+                        mapping[team_id] = name
+            except Exception as exc:
+                failures.append(f"{group_id}: {type(exc).__name__}")
+        if failures:
+            LOG.warning("ESPN conference lookups incomplete (%s): %s",
+                        len(failures), ", ".join(failures[:10]))
+        if not mapping:
+            raise ValueError("ESPN returned no team-to-conference memberships")
+        LOG.info("ESPN conferences: %s matched teams across %s conference groups",
+                 len(mapping), len(conference_ids))
+        return mapping
+
     def teams(self):
-        return self.get("teams", {"group": 50, "limit": 1000})
+        payload = self.get("teams", {"group": 50, "limit": 1000})
+        # NCAA season labels use the ENDING calendar year (Nov 2026 -> 2027).
+        today = datetime.now(CENTRAL).date()
+        season = today.year + (1 if today.month >= 7 else 0)
+        try:
+            memberships = self.conference_memberships(season)
+        except Exception as exc:
+            # Team/game collection must still work if ESPN's optional
+            # conference endpoint is temporarily unavailable.
+            LOG.warning("Conference lookup unavailable; keeping existing conference values: %s", exc)
+            memberships = {}
+        enriched = 0
+        for sport in payload.get("sports") or []:
+            for league in sport.get("leagues") or []:
+                for wrapper in league.get("teams") or []:
+                    team = wrapper.get("team", wrapper)
+                    if not isinstance(team, dict):
+                        continue
+                    conference = memberships.get(str(team.get("id")))
+                    if conference:
+                        prior_group = team.get("groups")
+                        group_details = prior_group.copy() if isinstance(prior_group, dict) else {}
+                        group_details["name"] = conference
+                        team["groups"] = group_details
+                        enriched += 1
+        LOG.info("Flat ESPN team list: conference assigned to %s teams", enriched)
+        return payload
 
     def scoreboard(self, day):
         return self.get("scoreboard", {"dates": day.strftime("%Y%m%d"), "groups": 50, "limit": 500})
