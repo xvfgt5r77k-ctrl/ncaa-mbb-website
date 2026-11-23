@@ -1,0 +1,64 @@
+name: NCAA MBB Consolidated Historical Evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ncaa-mbb-consolidated-historical-evaluation
+  cancel-in-progress: false
+
+jobs:
+  evaluate-verified-archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the historical report script
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Retrieve most recent available verified history artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=false
+          while read -r run_id; do
+            [ -n "$run_id" ] || continue
+            folder="archived_data/$run_id"
+            mkdir -p "$folder"
+            if gh run download "$run_id" -n ncaa-mbb-verified-history -D "$folder"; then
+              echo "ARCHIVE_FOLDER=$folder" >> "$GITHUB_ENV"
+              echo "Using export run $run_id"
+              found=true
+              break
+            fi
+          done < <(gh run list --workflow export-historical-dataset.yml --branch main --status success --limit 15 --json databaseId --jq '.[].databaseId')
+          if [ "$found" != true ]; then
+            echo '::error::No downloadable dataset artifact from a recent successful export. Rerun Export NCAA MBB Historical Dataset.'
+            exit 1
+          fi
+      - name: Verify archive and prepare independent historical report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find "$ARCHIVE_FOLDER" -maxdepth 1 -type f -name 'ncaa_mbb_history_*.zip' | sort)
+          if [ "${#archives[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one historical ZIP within the downloaded artifact"
+            exit 1
+          fi
+          python historical_evaluation_report.py --archive "${archives[0]}" --output-dir historical_reports
+      - name: Upload the consolidated evaluation as a private workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-historical-evaluation
+          path: historical_reports/
+          retention-days: 30
+          if-no-files-found: error
