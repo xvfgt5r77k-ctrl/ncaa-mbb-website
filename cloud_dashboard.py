@@ -836,7 +836,7 @@ st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & hist
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -1702,6 +1702,160 @@ elif page == "Player season averages":
             show_table(table)
             st.download_button("Download season averages (CSV)", table.to_csv(index=False),
                                f"ncaa_player_season_averages_{season}.csv", "text/csv")
+
+elif page == "Historical Data Quality":
+    st.subheader("Historical data quality & pregame statistics")
+    st.caption("Coverage of completed ESPN games, strictly prior-date team features, "
+               "and season-separated scoring-baseline accuracy. These are "
+               "historical research diagnostics—not a trained game-outcome model.")
+    has_tables = query("""
+        SELECT to_regclass('public.historical_coverage_audit') IS NOT NULL AS coverage,
+               to_regclass('public.pregame_team_features') IS NOT NULL AS features,
+               to_regclass('public.historical_score_baseline_audit') IS NOT NULL AS accuracy
+    """)
+    if has_tables.empty or not all(bool(has_tables.iloc[0][name])
+                                   for name in ("coverage", "features", "accuracy")):
+        st.info("Historical QA tables haven't been created yet. In GitHub Actions, "
+                "run 'Verify NCAA MBB Historical Pregame Data' after uploading "
+                "pregame_quality.py and its workflow.")
+    else:
+        coverage_tab, pregame_tab, accuracy_tab = st.tabs([
+            "Coverage audit", "Pregame-only statistics", "Holdout accuracy audit"
+        ])
+        with coverage_tab:
+            coverage_data = query("""
+                SELECT season, all_game_records, completed_games,
+                       not_completed_games, d1_matchups, complete_scores,
+                       both_box_scores, usable_stat_games, score_mismatches,
+                       incomplete_possessions, missing_start_time
+                FROM historical_coverage_audit
+                ORDER BY season DESC
+            """)
+            if coverage_data.empty:
+                st.info("No coverage audit has been generated. Run the workflow.")
+            else:
+                display = coverage_data.copy()
+                display["Season"] = display["season"].map(historical_season_label)
+                display = display.rename(columns={
+                    "all_game_records": "All records",
+                    "completed_games": "Completed", "not_completed_games": "Not completed",
+                    "d1_matchups": "Completed D1 vs D1",
+                    "complete_scores": "Final scores present",
+                    "both_box_scores": "Two box scores",
+                    "usable_stat_games": "Usable box scores",
+                    "score_mismatches": "Score mismatches",
+                    "incomplete_possessions": "Invalid/missing possessions",
+                    "missing_start_time": "Missing tipoff timestamp"
+                }).drop(columns=["season"])
+                display = display[["Season"] + [c for c in display if c != "Season"]]
+                show_table(display)
+                st.caption("'Not completed' includes cancellations, postponements "
+                           "and other uncompleted records; it is not the number of "
+                           "missing results. Current is_D1 flags may not reflect "
+                           "a program's historical classification.")
+                st.download_button("Download coverage audit (CSV)",
+                                   display.to_csv(index=False),
+                                   "ncaa_coverage_audit.csv", "text/csv",
+                                   key="qa_coverage_download")
+        with pregame_tab:
+            st.caption("Each row describes ONE team before a completed game. "
+                       "Same-day games are excluded from the input history, "
+                       "including when an earlier tipoff time was recorded. "
+                       "Adjusted ratings come only from an earlier snapshot date.")
+            total = query("""
+                SELECT COUNT(*) AS rows_count,
+                       COUNT(*) FILTER (WHERE games_before >= 5) AS rows_with_history,
+                       COUNT(*) FILTER (WHERE rating_snapshot_date IS NOT NULL)
+                           AS rows_with_adjusted_rating,
+                       COUNT(*) FILTER (WHERE rating_snapshot_date >= game_date)
+                           AS snapshot_leak_violations
+                FROM pregame_team_features WHERE season=%s
+            """, (season,))
+            if total.empty or int(total.iloc[0]["rows_count"]) == 0:
+                st.info("No pregame features for this season. Run the historical QA workflow.")
+            else:
+                x = total.iloc[0]
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("Pregame team rows", f"{int(x['rows_count']):,}")
+                c2.metric("5+ prior box scores", f"{int(x['rows_with_history']):,}")
+                c3.metric("Prior adjusted ratings", f"{int(x['rows_with_adjusted_rating']):,}")
+                c4.metric("Snapshot date violations", f"{int(x['snapshot_leak_violations']):,}")
+                choices = query("""
+                    SELECT DISTINCT f.team_id, t.name
+                    FROM pregame_team_features f JOIN teams t ON t.team_id=f.team_id
+                    WHERE f.season=%s
+                    ORDER BY t.name,f.team_id
+                """, (season,))
+                if not choices.empty:
+                    team_ids = choices["team_id"].astype(str).tolist()
+                    names = dict(zip(team_ids,choices["name"].tolist()))
+                    selected = st.selectbox("Inspect team's pregame history",team_ids,
+                                            format_func=lambda tid:names[tid],
+                                            key="qa_team")
+                    rows = query("""
+                        SELECT f.game_date AS "Date", ot.name AS "Opponent",
+                               CASE WHEN f.neutral_site=1 THEN 'Neutral'
+                                    WHEN f.is_home=1 THEN 'Home' ELSE 'Away' END
+                                    AS "Location",
+                               f.games_before AS "GP before",
+                               ROUND(f.avg_points_for::numeric,1) AS "Prior PPG",
+                               ROUND(f.avg_points_against::numeric,1) AS "Prior Opp PPG",
+                               ROUND(f.raw_net::numeric,1) AS "Prior raw net/100",
+                               ROUND(f.adjusted_net_before::numeric,1) AS "Prior adjusted net",
+                               ROUND(f.opponent_sos_before::numeric,1) AS "Prior SOS",
+                               f.rest_days AS "Full rest days",
+                               f.rating_snapshot_date AS "Rating as-of"
+                        FROM pregame_team_features f
+                        JOIN teams ot ON ot.team_id=f.opponent_id
+                        WHERE f.season=%s AND f.team_id=%s
+                        ORDER BY f.game_date,f.game_id
+                    """, (season,selected))
+                    if not rows.empty:
+                        show_table(rows)
+                        st.download_button("Download selected team's pregame stats (CSV)",
+                                           rows.to_csv(index=False),
+                                           f"ncaa_pregame_{season}_{selected}.csv", "text/csv",
+                                           key="qa_pregame_download")
+                st.caption("GP before counts previous games with usable team box "
+                           "scores, not all prior completed games. Missing early-season "
+                           "averages and prior adjusted ratings are left blank on purpose.")
+        with accuracy_tab:
+            st.markdown("#### Historical scoring-baseline accuracy")
+            st.caption("This simple benchmark uses each team's mean points "
+                       "from at least five earlier usable games and checks its "
+                       "absolute scoring error on later D1-vs-D1 games. It is "
+                       "evaluated chronologically, with no same-day data. "
+                       "It does NOT measure a trained game's winner accuracy "
+                       "or prove the accuracy of a future prediction engine.")
+            audits = query("""
+                SELECT season, split_name, eligible_d1_games,
+                       evaluated_games, evaluated_team_scores,
+                       ROUND(points_mae::numeric,2) AS points_mae,
+                       ROUND(points_rmse::numeric,2) AS points_rmse,
+                       ROUND(points_bias::numeric,2) AS points_bias
+                FROM historical_score_baseline_audit ORDER BY season
+            """)
+            if audits.empty:
+                st.info("No historical scoring-baseline audit yet. Run the workflow.")
+            else:
+                display = audits.rename(columns={
+                    "season": "ESPN season", "split_name": "Split",
+                    "eligible_d1_games": "D1 games with scores",
+                    "evaluated_games": "Evaluated games",
+                    "evaluated_team_scores": "Team scores evaluated",
+                    "points_mae": "Points MAE",
+                    "points_rmse": "Points RMSE",
+                    "points_bias": "Mean bias"
+                })
+                show_table(display)
+                st.caption("Development = older seasons; validation = next-to-last "
+                           "season; test = latest completed season in the workflow "
+                           "range. MAE is in team points. These are out-of-season "
+                           "checks of an unfitted rolling baseline, NOT a trained model.")
+                st.download_button("Download accuracy audit (CSV)",
+                                   display.to_csv(index=False),
+                                   "ncaa_scoring_accuracy_audit.csv", "text/csv",
+                                   key="qa_accuracy_download")
 
 elif page == "Injuries":
     st.subheader("Official conference player availability")
