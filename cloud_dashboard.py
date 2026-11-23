@@ -6,12 +6,15 @@ browser; data is read from PostgreSQL using parameterized, read-only queries.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="NCAA MBB | Team Stats", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="NCAA MBB | Game Schedules & Stats", page_icon="🏀", layout="wide")
+
+CENTRAL = ZoneInfo("America/Chicago")
 
 
 @st.cache_resource(show_spinner=False)
@@ -77,11 +80,62 @@ def show_table(frame: pd.DataFrame, columns: list[str] | None = None):
                  hide_index=True)
 
 
+SCHEDULE_QUERY = """
+    SELECT g.game_id, g.game_date, g.start_time_utc, g.status_detail, g.status,
+           g.completed, g.away_score, g.home_score,
+           a.name AS away, h.name AS home, g.venue
+    FROM games g
+    JOIN teams a ON a.team_id = g.away_team_id
+    JOIN teams h ON h.team_id = g.home_team_id
+    WHERE g.season = %s AND g.game_date >= %s AND g.game_date <= %s
+    ORDER BY g.game_date, g.start_time_utc NULLS LAST, g.game_id
+"""
+
+
+def central_tipoff(timestamp: str | None) -> str:
+    """Format ESPN's stored UTC tip-off time as local Central time."""
+    if not timestamp or pd.isna(timestamp):
+        return "TBD"
+    try:
+        value = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(CENTRAL).strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        return "TBD"
+
+
+def schedule_display(games: pd.DataFrame) -> pd.DataFrame:
+    """Make a compact, phone-friendly schedule table without exposing raw IDs."""
+    if games.empty:
+        return pd.DataFrame(columns=["Time (CT)", "Matchup", "Score", "Status", "Venue"])
+    output = pd.DataFrame()
+    output["Time (CT)"] = games["start_time_utc"].map(central_tipoff)
+    output["Matchup"] = games["away"] + " @ " + games["home"]
+    def score(row):
+        # A scheduled game is not a 0–0 final, even if ESPN supplies zeros.
+        if row["status"] in ("STATUS_SCHEDULED", "STATUS_POSTPONED", "STATUS_CANCELED"):
+            return "—"
+        if pd.notna(row["away_score"]) and pd.notna(row["home_score"]):
+            return f"{int(row['away_score'])}–{int(row['home_score'])}"
+        return "—"
+
+    output["Score"] = games.apply(score, axis=1)
+    output["Status"] = games["status_detail"].fillna("")
+    output.loc[output["Status"].eq(""), "Status"] = games["status"].fillna("TBD")
+    output["Venue"] = games["venue"].fillna("—")
+    return output
+
+
+def load_schedule(season: int, start_date: str, end_date: str) -> pd.DataFrame:
+    return query(SCHEDULE_QUERY, (season, start_date, end_date))
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • unadjusted, possession-based efficiency • Central Time")
 with st.sidebar:
     st.header("Navigation")
-    page = st.radio("Section", ["Team efficiency", "Games & schedules", "Team explorer",
+    page = st.radio("Section", ["Game schedules", "Team efficiency", "Team explorer",
                                     "Player box scores", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
@@ -97,7 +151,56 @@ except Exception:
     st.error("Cannot read cloud database yet. Confirm the database connection string and run the first import in GitHub Actions. Check deployment logs for details.")
     st.stop()
 
-if page == "Team efficiency":
+if page == "Game schedules":
+    st.subheader("Game schedules")
+    st.caption("Times shown in America/Chicago. ESPN data is saved by your GitHub importer, not streamed live. "
+               "Use Refresh displayed data after an import finishes.")
+    today = datetime.now(CENTRAL).date()
+    today_str = today.isoformat()
+    today_tab, upcoming_tab, browse_tab = st.tabs(["🏀 Today's games", "📅 Future schedule", "🔎 Browse dates"])
+
+    with today_tab:
+        st.markdown(f"**{today.strftime('%A, %B')} {today.day}, {today.year}**")
+        today_games = load_schedule(season, today_str, today_str)
+        st.metric("Games on today's schedule", len(today_games))
+        if today_games.empty:
+            st.info("No games for today in the database yet. If the importer hasn't run recently, "
+                    "use GitHub Actions → Run workflow with both date fields blank to load recent "
+                    "results and the next 14 days of schedules.")
+        else:
+            show_table(schedule_display(today_games))
+
+    with upcoming_tab:
+        window = st.selectbox("Look ahead", [7, 14, 30], index=1,
+                              format_func=lambda days: f"Next {days} days")
+        start = today + timedelta(days=1)
+        end = today + timedelta(days=window)
+        upcoming = load_schedule(season, start.isoformat(), end.isoformat())
+        if not upcoming.empty:
+            upcoming = upcoming.loc[upcoming["completed"].eq(0)].copy()
+        st.metric("Upcoming games in the database", len(upcoming))
+        if upcoming.empty:
+            st.info("No future games found for this range. Run the nightly ESPN updater "
+                    "manually with both date fields blank to import the next 14 days. "
+                    "Dates farther out may not have been imported yet.")
+        else:
+            for date_value, day_games in upcoming.groupby("game_date", sort=True):
+                date_label = datetime.strptime(date_value, "%Y-%m-%d").strftime("%A, %B %d")
+                st.markdown(f"**{date_label} · {len(day_games)} games**")
+                show_table(schedule_display(day_games))
+
+    with browse_tab:
+        dates = query("SELECT DISTINCT game_date FROM games WHERE season=%s "
+                      "ORDER BY game_date DESC", (season,))
+        if dates.empty:
+            st.info("No games imported yet.")
+        else:
+            date_string = st.selectbox("Choose a date (Central Time)", dates["game_date"].tolist())
+            games_on_date = load_schedule(season, date_string, date_string)
+            st.caption(f"{len(games_on_date)} games")
+            show_table(schedule_display(games_on_date))
+
+elif page == "Team efficiency":
     st.subheader("Team efficiency rankings")
     try:
         ranks = query(RANKINGS_QUERY, (season,))
@@ -115,28 +218,6 @@ if page == "Team efficiency":
         cols = ["Rank","Team","Conference","GP","W","L","Off / 100","Def / 100","Net / 100","eFG %","TO %"]
         show_table(display, cols)
         st.download_button("Download rankings (CSV)", display[cols].to_csv(index=False), "rankings.csv", "text/csv")
-
-elif page == "Games & schedules":
-    st.subheader("Schedules & results")
-    dates = query("SELECT DISTINCT game_date FROM games WHERE season=%s ORDER BY game_date DESC", (season,))
-    if dates.empty:
-        st.info("No games imported yet.")
-    else:
-        date_string = st.selectbox("Date (America/Chicago)", dates["game_date"].tolist())
-        games = query("""
-            SELECT g.game_id,g.start_time_utc,g.status_detail,g.status,g.completed,
-                   g.away_score,g.home_score, a.name AS away, h.name AS home, g.venue
-            FROM games g JOIN teams a ON a.team_id=g.away_team_id
-            JOIN teams h ON h.team_id=g.home_team_id
-            WHERE g.season=%s AND g.game_date=%s ORDER BY g.start_time_utc,g.game_id
-        """, (season, date_string))
-        if not games.empty:
-            games["Matchup"] = games["away"] + " @ " + games["home"]
-            games["Score"] = games.apply(
-                lambda r: f"{int(r.away_score)}–{int(r.home_score)}" if r.completed and
-                pd.notna(r.away_score) and pd.notna(r.home_score) else "—", axis=1)
-            show_table(games.rename(columns={"status_detail":"Status","venue":"Venue"}),
-                       ["Matchup","Score","Status","Venue"])
 
 elif page == "Team explorer":
     st.subheader("Team explorer")
