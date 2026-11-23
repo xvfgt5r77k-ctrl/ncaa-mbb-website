@@ -1522,12 +1522,272 @@ def historical_error_bins(data: pd.DataFrame) -> pd.DataFrame:
                          "Team scores": [int(counts.get(k, 0)) for k in names]})
 
 
+
+# Compare the already-established, unfitted scoring-average baseline across
+# two held-out seasons. All data are from completed games with prior-date
+# features; these functions do not train a model or forecast future games.
+def historical_holdout_comparison(errors: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive team-score error for validation (2025) and holdout (2026)."""
+    names = {2025: "2024–25 validation", 2026: "2025–26 final holdout"}
+    columns = ["Season", "Period", "Games", "Team scores", "MAE", "RMSE",
+               "Bias", "Median abs. error", "P90 abs. error",
+               "Within 5 pts (%)", "Within 10 pts (%)"]
+    if errors.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for season in (2025, 2026):
+        part = errors.loc[errors["season"] == season]
+        if part.empty:
+            continue
+        annual = historical_error_summary(part, ["season"]).iloc[0]
+        rows.append({
+            "Season": season, "Period": names[season],
+            "Games": int(annual["Games"]),
+            "Team scores": int(annual["Team scores"]),
+            "MAE": annual["MAE"], "RMSE": annual["RMSE"],
+            "Bias": annual["Bias"],
+            "Median abs. error": annual["Median abs. error"],
+            "P90 abs. error": annual["P90 abs. error"],
+            "Within 5 pts (%)": round(100 * float(part["absolute_error"].le(5).mean()), 1),
+            "Within 10 pts (%)": round(100 * float(part["absolute_error"].le(10).mean()), 1),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def historical_holdout_delta_interval(errors: pd.DataFrame, samples: int = 400,
+                                     seed: int = 39) -> dict:
+    """Cluster-bootstrap holdout MAE minus validation MAE; resample entire games.
+
+    This is historical sampling variability, NOT a probability that a forecast
+    will have a given error. The two team scores within each game are dependent.
+    """
+    empty = {"mae_change": float("nan"), "ci_low": float("nan"),
+             "ci_high": float("nan"), "validation_games": 0, "holdout_games": 0}
+    if errors.empty:
+        return empty
+    by_year = {}
+    for yr in (2025, 2026):
+        part = errors.loc[errors["season"] == yr]
+        if part.empty:
+            return empty
+        game = part.groupby("game_id").agg(
+            absolute_sum=("absolute_error", "sum"), team_scores=("absolute_error", "size"))
+        if not (game["team_scores"] == 2).all():
+            return empty
+        by_year[yr] = game
+    a, b = by_year[2025], by_year[2026]
+    diff = float(b["absolute_sum"].sum() / b["team_scores"].sum() -
+                 a["absolute_sum"].sum() / a["team_scores"].sum())
+    result = {"mae_change": round(diff, 2), "ci_low": float("nan"),
+              "ci_high": float("nan"), "validation_games": len(a),
+              "holdout_games": len(b)}
+    if min(len(a), len(b)) < 20 or samples < 20:
+        return result
+    rng = np.random.default_rng(seed)
+    draws = []
+    for game in (a, b):
+        n = len(game)
+        idx = rng.integers(0, n, size=(samples, n))
+        sums = game["absolute_sum"].to_numpy(dtype=float)
+        counts = game["team_scores"].to_numpy(dtype=float)
+        draws.append(sums[idx].sum(axis=1) / counts[idx].sum(axis=1))
+    low, high = np.quantile(draws[1] - draws[0], [.025, .975])
+    result["ci_low"] = round(float(low), 2)
+    result["ci_high"] = round(float(high), 2)
+    return result
+
+
+def historical_holdout_by_group(errors: pd.DataFrame, field: str,
+                               minimum_team_scores: int = 50) -> pd.DataFrame:
+    """Comparable group summaries; omit groups too small in either season."""
+    columns = ["Group", "Validation games", "Holdout games", "Validation MAE",
+               "Holdout MAE", "Change in MAE"]
+    if errors.empty or field not in ("venue", "history_band"):
+        return pd.DataFrame(columns=columns)
+    working = errors.copy()
+    working["group_label"] = working[field].astype("string")
+    outputs = []
+    for label in sorted(working["group_label"].dropna().unique()):
+        parts = {yr: working[(working["season"] == yr) &
+                              (working["group_label"] == label)] for yr in (2025, 2026)}
+        if any(len(subset) < minimum_team_scores for subset in parts.values()):
+            continue
+        vals = {yr: float(subset["absolute_error"].mean()) for yr, subset in parts.items()}
+        outputs.append({
+            "Group": label,
+            "Validation games": int(parts[2025]["game_id"].nunique()),
+            "Holdout games": int(parts[2026]["game_id"].nunique()),
+            "Validation MAE": round(vals[2025], 2),
+            "Holdout MAE": round(vals[2026], 2),
+            "Change in MAE": round(vals[2026] - vals[2025], 2),
+        })
+    return pd.DataFrame(outputs, columns=columns)
+
+
+def historical_holdout_coverage(raw: pd.DataFrame, errors: pd.DataFrame) -> pd.DataFrame:
+    """Denominator is games with two ESPN-consistent box scores + pregame rows."""
+    columns = ["Season", "Candidate games", "Evaluated games", "Coverage (%)"]
+    if raw.empty:
+        return pd.DataFrame(columns=columns)
+    result = []
+    for season in (2025, 2026):
+        subset = raw.loc[raw["season"] == season]
+        candidates = subset.groupby("game_id").agg(
+            records=("team_id", "size"), teams=("team_id", "nunique"))
+        n = int(((candidates["records"] == 2) & (candidates["teams"] == 2)).sum())
+        matched = errors.loc[errors["season"] == season]
+        eligible = int(matched["game_id"].nunique()) if not matched.empty else 0
+        result.append({"Season": season, "Candidate games": n,
+                       "Evaluated games": eligible,
+                       "Coverage (%)": round(100 * eligible/n, 1) if n else float("nan")})
+    return pd.DataFrame(result, columns=columns)
+
+
+# Historical distribution drift is a retrospective data-coverage study only.
+# The columns below represent strictly PRE-GAME numbers from completed games.
+# The 2025-26 holdout is used for reporting, not feature selection or tuning.
+DRIFT_METRICS = {
+    "Prior points per game": "prior_ppg",
+    "Prior offensive efficiency": "prior_offense",
+    "Prior defensive efficiency": "prior_defense",
+    "Prior adjusted net efficiency": "prior_adj_net",
+    "Prior strength of schedule": "prior_sos",
+    "Prior possessions per game": "prior_pace",
+    "Recent five-game scoring margin": "recent_margin",
+    "Rest days": "rest_days",
+}
+
+
+def historical_drift_prepare(raw: pd.DataFrame, min_history: int = 5) -> pd.DataFrame:
+    """Only paired, completed-game team pregame observations with adequate history.
+
+    The source SQL ensures each joined team result is consistent with the final
+    score, and feature_analysis_prepare masks ratings not strictly before the
+    game. Exclude one-sided and duplicate game rows in the final eligible set.
+    """
+    data = feature_analysis_prepare(raw, min_history=min_history)
+    if data.empty:
+        return data
+    data = data.dropna(subset=["season", "game_id", "team_id"]).copy()
+    counts = data.groupby(["season", "game_id"], sort=False).agg(
+        records=("team_id", "size"), teams=("team_id", "nunique")
+    ).reset_index()
+    valid = counts.loc[(counts["records"] == 2) & (counts["teams"] == 2),
+                       ["season", "game_id"]]
+    if valid.empty:
+        return data.iloc[0:0].copy()
+    return data.merge(valid, on=["season", "game_id"], how="inner",
+                      validate="many_to_one")
+
+
+def historical_drift_period(season: int) -> str:
+    if 2022 <= int(season) <= 2024:
+        return "Development (2021–24)"
+    if int(season) == 2025:
+        return "Validation (2024–25)"
+    if int(season) == 2026:
+        return "Holdout (2025–26)"
+    return "Other"
+
+
+def historical_drift_coverage(data: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Season", "Completed games", "Team-game rows", "D1 teams",
+               "Median prior games"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for season, group in data.groupby("season", sort=True):
+        rows.append({
+            "Season": int(season),
+            "Completed games": int(group["game_id"].nunique()),
+            "Team-game rows": int(len(group)),
+            "D1 teams": int(group["team_id"].nunique()),
+            "Median prior games": float(group["games_before"].median()),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def historical_drift_summary(data: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Compare distribution summaries; no fitting, hypothesis test, or prediction."""
+    columns = ["Period", "Team-game rows", "Available", "Missing %", "Mean",
+               "Median", "P10", "P90", "Difference / development SD"]
+    if data.empty or metric not in DRIFT_METRICS:
+        return pd.DataFrame(columns=columns)
+    feature = DRIFT_METRICS[metric]
+    work = data.copy()
+    work["_period"] = work["season"].map(historical_drift_period)
+    develop = pd.to_numeric(
+        work.loc[work["_period"] == "Development (2021–24)", feature],
+        errors="coerce").dropna()
+    development_mean = float(develop.mean()) if len(develop) else float("nan")
+    development_std = float(develop.std(ddof=1)) if len(develop) > 1 else float("nan")
+    rows = []
+    for label in ("Development (2021–24)", "Validation (2024–25)", "Holdout (2025–26)"):
+        group = work.loc[work["_period"] == label]
+        values = pd.to_numeric(group[feature], errors="coerce").dropna()
+        mean = float(values.mean()) if len(values) else float("nan")
+        delta = float("nan")
+        if (len(values) and len(develop) > 1 and pd.notna(development_std)
+                and development_std > 0):
+            delta = (mean - development_mean) / development_std
+        rows.append({
+            "Period": label,
+            "Team-game rows": int(len(group)),
+            "Available": int(len(values)),
+            "Missing %": round(100.0 * (1 - len(values) / len(group)), 1)
+                         if len(group) else float("nan"),
+            "Mean": round(mean, 2),
+            "Median": round(float(values.median()), 2) if len(values) else float("nan"),
+            "P10": round(float(values.quantile(.1)), 2) if len(values) else float("nan"),
+            "P90": round(float(values.quantile(.9)), 2) if len(values) else float("nan"),
+            "Difference / development SD": round(delta, 3),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def historical_drift_trend(data: pd.DataFrame, metric: str) -> pd.DataFrame:
+    columns = ["Season", "Team-game rows", "Available", "Mean", "Median", "P10", "P90"]
+    if data.empty or metric not in DRIFT_METRICS:
+        return pd.DataFrame(columns=columns)
+    feature = DRIFT_METRICS[metric]
+    rows = []
+    for season, group in data.groupby("season", sort=True):
+        vals = pd.to_numeric(group[feature], errors="coerce").dropna()
+        rows.append({
+            "Season": int(season), "Team-game rows": int(len(group)),
+            "Available": int(len(vals)),
+            "Mean": round(float(vals.mean()), 2) if len(vals) else float("nan"),
+            "Median": round(float(vals.median()), 2) if len(vals) else float("nan"),
+            "P10": round(float(vals.quantile(.1)), 2) if len(vals) else float("nan"),
+            "P90": round(float(vals.quantile(.9)), 2) if len(vals) else float("nan"),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def historical_drift_venue_mix(data: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Period", "Venue", "Team-game rows", "Percent of period"]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    work = data.copy()
+    work["_period"] = work["season"].map(historical_drift_period)
+    rows = []
+    for label in ("Development (2021–24)", "Validation (2024–25)", "Holdout (2025–26)"):
+        period = work.loc[work["_period"] == label]
+        for venue in ("Home", "Away", "Neutral"):
+            count = int(period["venue"].eq(venue).sum())
+            rows.append({"Period": label, "Venue": venue,
+                         "Team-game rows": count,
+                         "Percent of period": round(100.0 * count / len(period), 1)
+                                              if len(period) else float("nan")})
+    return pd.DataFrame(rows, columns=columns)
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -2993,6 +3253,176 @@ elif page == "Historical Scoring Accuracy":
                             show_table(counts)
                     st.caption("No model training, future-game projections, win probabilities, "
                                "or automated wagering functions are included.")
+
+
+elif page == "Validation vs Holdout":
+    st.subheader("Validation vs Holdout — Historical Scoring Stability")
+    st.caption("Compare how the SAME unfitted prior-games scoring-average benchmark behaved "
+               "on completed games in 2024–25 and 2025–26. Lower MAE/RMSE means smaller "
+               "retrospective team-score error. No upcoming-game forecasts or wagers.")
+    table_ready = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS ok")
+    if table_ready.empty or not bool(table_ready.iloc[0]["ok"]):
+        st.info("Run 'Verify NCAA MBB Historical Pregame Data' in GitHub Actions first.")
+    else:
+        raw = query(FEATURE_ANALYSIS_SQL, (2025, 2026))
+        if raw.empty:
+            st.info("No completed games with paired box scores and pregame records "
+                    "were found for the validation and holdout seasons.")
+        else:
+            errors = historical_error_prepare(raw, min_history=5)
+            report = historical_holdout_comparison(errors)
+            if set(report["Season"].tolist()) != {2025, 2026}:
+                st.warning("Both historical seasons must have complete two-team games "
+                           "with at least five earlier usable games. Rerun the "
+                           "historical pregame verification workflow if data are missing.")
+            else:
+                comparison = historical_holdout_delta_interval(errors)
+                baseline = report.loc[report["Season"] == 2025].iloc[0]
+                holdout = report.loc[report["Season"] == 2026].iloc[0]
+                diff = comparison["mae_change"]
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("2024–25 validation MAE", f"{baseline['MAE']:.2f} pts")
+                col_b.metric("2025–26 holdout MAE", f"{holdout['MAE']:.2f} pts")
+                col_c.metric("Change (holdout − validation)", f"{diff:+.2f} pts")
+                if diff > 0:
+                    st.caption("The historical benchmark had a larger average scoring "
+                               "error on the newer holdout season.")
+                elif diff < 0:
+                    st.caption("The historical benchmark had a smaller average scoring "
+                               "error on the newer holdout season.")
+                else:
+                    st.caption("The two seasons have the same rounded average scoring error.")
+                if pd.notna(comparison["ci_low"]):
+                    st.caption(f"95% game-cluster bootstrap interval for the observed "
+                               f"holdout minus validation MAE: {comparison['ci_low']:+.2f} "
+                               f"to {comparison['ci_high']:+.2f} points. "
+                               "This measures historical sampling variability, "
+                               "not a guarantee for future games.")
+                summary_tab, by_group_tab, coverage_tab = st.tabs([
+                    "Season comparison", "Venue & sample size", "Coverage & methods"
+                ])
+                with summary_tab:
+                    st.markdown("#### Error measurements on previously completed games")
+                    show_table(report.drop(columns=["Season"]))
+                    st.bar_chart(report.set_index("Period")[["MAE", "RMSE", "P90 abs. error"]])
+                    st.caption("Bias = earlier points-per-game average minus actual team "
+                               "points; positive values indicate historical overestimation. "
+                               "Within 5/10 points reports the percentage of evaluated "
+                               "team-score observations falling inside those absolute-error bands.")
+                    st.download_button("Download validation and holdout summary",
+                                       report.to_csv(index=False),
+                                       file_name="ncaa_validation_holdout_summary.csv",
+                                       mime="text/csv", key="validation_holdout_summary_download")
+                with by_group_tab:
+                    st.markdown("#### Did historical scoring errors change across game types?")
+                    breakdown = st.selectbox("Compare by", ["Venue", "Prior-game sample size"],
+                                              key="holdout_breakdown")
+                    field = "venue" if breakdown == "Venue" else "history_band"
+                    grouped = historical_holdout_by_group(errors, field)
+                    if grouped.empty:
+                        st.info("Too few complete team-score observations in the same group "
+                                "for both seasons; groups need at least 50 each.")
+                    else:
+                        show_table(grouped)
+                        st.bar_chart(grouped.set_index("Group")[["Validation MAE", "Holdout MAE"]])
+                        st.download_button("Download grouped comparison",
+                                           grouped.to_csv(index=False),
+                                           file_name=f"ncaa_holdout_{field}_comparison.csv",
+                                           mime="text/csv", key="validation_holdout_groups_download")
+                    st.caption("A change between seasons is an observed difference, "
+                               "not proof that venue or sample size caused it. "
+                               "Different teams and opponents appear in each season.")
+                with coverage_tab:
+                    coverage = historical_holdout_coverage(raw, errors)
+                    show_table(coverage)
+                    st.caption("Candidate games are those with exactly two distinct D1 "
+                               "pregame rows and consistent two-sided completed ESPN box "
+                               "scores. Evaluated games additionally require both teams "
+                               "to have at least five usable games before the game date "
+                               "and a nonmissing prior scoring average.")
+                    st.warning("The 2025–26 season is a historical holdout. Repeatedly "
+                               "tuning a new statistical method based on its results "
+                               "would make it no longer an independent test. These "
+                               "numbers describe an unfitted baseline, not winner "
+                               "accuracy, a trained prediction model, or a forecast guarantee.")
+    st.caption("Read-only: no new tables, no model training, and no GitHub workflow needed.")
+
+elif page == "Season Data Drift":
+    st.subheader("Season Data Drift — Historical Pregame Distributions")
+    st.caption("Examine whether earlier-date basketball statistics had different "
+               "distributions in development (2021–22 to 2023–24), validation "
+               "(2024–25), and historical holdout (2025–26) seasons. This report "
+               "does not train a model or estimate upcoming game outcomes.")
+    availability = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS ok")
+    if availability.empty or not bool(availability.iloc[0]["ok"]):
+        st.info("Run 'Verify NCAA MBB Historical Pregame Data' in GitHub Actions first.")
+    else:
+        raw = query(FEATURE_ANALYSIS_SQL, (2022, 2026))
+        data = historical_drift_prepare(raw, min_history=5)
+        if data.empty:
+            st.info("No paired completed games with at least five earlier games per "
+                    "team were found across the five historical seasons.")
+        else:
+            counts = historical_drift_coverage(data)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Historical games reviewed", f"{counts['Completed games'].sum():,}")
+            col2.metric("Paired team-game observations", f"{len(data):,}")
+            col3.metric("Seasons", str(counts['Season'].nunique()))
+            metric = st.selectbox("Prior-game statistic", list(DRIFT_METRICS),
+                                  key="drift_metric")
+            summary = historical_drift_summary(data, metric)
+            trend = historical_drift_trend(data, metric)
+            distribution_tab, timeline_tab, venue_tab, method_tab = st.tabs([
+                "Development vs newer seasons", "Year-by-year", "Venue mix", "Coverage & methods"
+            ])
+            with distribution_tab:
+                st.markdown("#### Historical distribution changes")
+                show_table(summary)
+                graph = summary.dropna(subset=["Mean"])
+                if not graph.empty:
+                    st.bar_chart(graph.set_index("Period")[["Mean"]])
+                st.caption("Difference / development SD = (period mean − development mean) "
+                           "divided by the standard deviation in the development sample. "
+                           "It is a descriptive scale, not a significance test or "
+                           "a model-accuracy metric. Large differences deserve review.")
+                st.download_button("Download distribution comparison", 
+                    summary.to_csv(index=False),
+                    file_name="ncaa_season_distribution_drift.csv", mime="text/csv",
+                    key="drift_period_csv")
+            with timeline_tab:
+                st.markdown("#### Year-by-year pregame distributions")
+                show_table(trend)
+                if not trend.dropna(subset=["Median"]).empty:
+                    st.line_chart(trend.set_index("Season")[["Median", "P10", "P90"]])
+                st.caption("P10/P90 mark the middle 80% of observed prior-game "
+                           "statistics. These values vary with sample composition "
+                           "and are not future confidence intervals.")
+                st.download_button("Download yearly statistics", trend.to_csv(index=False),
+                    file_name="ncaa_season_drift_yearly.csv", mime="text/csv",
+                    key="drift_yearly_csv")
+            with venue_tab:
+                st.markdown("#### Historical venue mix")
+                mix = historical_drift_venue_mix(data)
+                show_table(mix)
+                st.caption("Changes in home/away/neutral composition can contribute "
+                           "to differences between historical scoring samples.")
+            with method_tab:
+                st.markdown("#### Games and teams included")
+                show_table(counts)
+                if data["invalid_prior_rating"].any():
+                    st.warning(f"{int(data['invalid_prior_rating'].sum()):,} earlier-date "
+                               "rating records failed the strict date check and were "
+                               "masked before this report.")
+                st.caption("Only finished D1 games with valid, two-sided ESPN box "
+                           "scores and two distinct teams' pregame features enter the "
+                           "report. Both teams must have at least five earlier games. "
+                           "Any adjusted rating with a same-date or later snapshot "
+                           "is excluded. Missing values remain missing; they are not "
+                           "filled with full-season or final results.")
+                st.warning("Reviewing the 2025–26 holdout repeatedly can compromise "
+                           "its independence if it is later used to tune a model. "
+                           "Treat these as retrospective diagnostics only.")
+    st.caption("Read-only dashboard; no new Supabase tables or scheduled jobs required.")
 
 elif page == "Advanced Matchup Comparison":
     st.subheader("Advanced Matchup Comparison")
