@@ -831,12 +831,51 @@ def historical_number(value, signed: bool = False) -> str:
     return f"{float(value):+.1f}" if signed else f"{float(value):.1f}"
 
 
+
+
+def scoring_pattern_metrics(frame: pd.DataFrame) -> pd.DataFrame:
+    """Retrospective descriptive scoring variation only; no future fixtures or picks.
+
+    Rows must be from completed games with usable box scores. A null prior
+    season average is not silently replaced by a current-game statistic.
+    """
+    cols = ["game_date", "team_id", "team", "location", "games_before", "prior_ppg", "points"]
+    if frame.empty:
+        return pd.DataFrame(columns=cols + ["score_difference", "absolute_difference", "history_group", "month"])
+    df = frame[cols].copy()
+    for col in ("games_before", "prior_ppg", "points"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = df.dropna(subset=["game_date", "prior_ppg", "points", "games_before"])
+    df = df[(df["games_before"] >= 5) & (df["points"] >= 0)]
+    df["score_difference"] = df["points"] - df["prior_ppg"]
+    df["absolute_difference"] = df["score_difference"].abs()
+    df["history_group"] = pd.cut(df["games_before"],
+                                  bins=[4, 9, 19, float("inf")],
+                                  labels=["5–9 prior games", "10–19 prior games", "20+ prior games"])
+    df["month"] = df["game_date"].dt.strftime("%Y-%m")
+    return df.sort_values(["game_date", "team"], kind="stable")
+
+
+def scoring_pattern_group_summary(frame: pd.DataFrame, by: str) -> pd.DataFrame:
+    """Aggregated historical observations, never forward game estimates."""
+    if frame.empty:
+        return pd.DataFrame(columns=[by, "Team box scores", "Scored PPG", "Typical variation", "Score SD"])
+    groups = frame.groupby(by, observed=True, dropna=False).agg(
+        games=("points", "size"),
+        ppg=("points", "mean"),
+        deviation=("absolute_difference", "mean"),
+        standard_deviation=("points", "std")
+    ).reset_index()
+    return groups.rename(columns={"games": "Team box scores", "ppg": "Scored PPG",
+                                  "deviation": "Typical variation", "standard_deviation": "Score SD"}).round(2)
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -1856,6 +1895,96 @@ elif page == "Historical Data Quality":
                                    display.to_csv(index=False),
                                    "ncaa_scoring_accuracy_audit.csv", "text/csv",
                                    key="qa_accuracy_download")
+
+
+elif page == "Historical Scoring Review":
+    st.subheader("Historical scoring review")
+    st.caption("Retrospective descriptive analysis of completed games. This page does not "
+               "forecast future games or generate winner probabilities, picks, or odds.")
+    existing = query("SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS exists")
+    if existing.empty or not bool(existing.iloc[0]["exists"]):
+        st.info("First run the Verify NCAA MBB Historical Pregame Data workflow.")
+    else:
+        source_rows = query("""
+            SELECT f.game_date, f.team_id, t.name AS team,
+                   CASE WHEN f.neutral_site=1 THEN 'Neutral'
+                        WHEN f.is_home=1 THEN 'Home' ELSE 'Away' END AS location,
+                   f.games_before,
+                   f.avg_points_for AS prior_ppg,
+                   s.points AS points
+            FROM pregame_team_features f
+            JOIN games g ON g.game_id=f.game_id
+              AND g.season=f.season AND g.completed=1
+            JOIN teams t ON t.team_id=f.team_id
+            JOIN team_game_stats s ON s.game_id=f.game_id AND s.team_id=f.team_id
+            WHERE f.season=%s AND f.games_before >= 5
+              AND f.avg_points_for IS NOT NULL
+              AND s.points IS NOT NULL
+              AND s.possessions > 0
+              AND s.points = CASE WHEN f.is_home=1 THEN g.home_score
+                                  ELSE g.away_score END
+            ORDER BY f.game_date, t.name
+        """, (season,))
+        patterns = scoring_pattern_metrics(source_rows)
+        if patterns.empty:
+            st.info("No eligible games in this season yet. Refresh the pregame history workflow.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Historical team box scores", f"{len(patterns):,}")
+            c2.metric("Average actual points", f"{patterns['points'].mean():.1f}")
+            c3.metric("Typical scoring variation", f"{patterns['absolute_difference'].mean():.1f} points")
+            st.caption("Typical variation is the mean absolute difference between a team's "
+                       "earlier-season scoring average and its actual historical game score. "
+                       "It is not a future-game accuracy guarantee.")
+
+            location_tab, maturity_tab, timeline_tab, team_tab = st.tabs([
+                "By location", "By season stage", "Monthly patterns", "Team scoring history"
+            ])
+            with location_tab:
+                st.markdown("#### Historical scoring by venue")
+                loc_summary = scoring_pattern_group_summary(patterns, "location")
+                show_table(loc_summary)
+                st.caption("Home/away/neutral are taken from the historical game data; "
+                           "these aggregates do not adjust for opponent quality.")
+            with maturity_tab:
+                st.markdown("#### Historical scoring as the season develops")
+                stage_summary = scoring_pattern_group_summary(patterns, "history_group")
+                show_table(stage_summary)
+                st.caption("Groups are based on how many earlier usable box scores "
+                           "the team had before each completed game.")
+            with timeline_tab:
+                st.markdown("#### Variation over the historical season")
+                monthly = scoring_pattern_group_summary(patterns, "month")
+                show_table(monthly)
+                if not monthly.empty:
+                    st.line_chart(monthly.set_index("month")[["Typical variation"]])
+            with team_tab:
+                st.markdown("#### Explore a team's completed scoring history")
+                names = (patterns[["team_id", "team"]].drop_duplicates()
+                         .sort_values(["team", "team_id"]))
+                ids = names["team_id"].astype(str).tolist()
+                labels = dict(zip(ids, names["team"].astype(str)))
+                if ids:
+                    chosen = st.selectbox("Team", ids,
+                                          format_func=lambda tid: labels[tid],
+                                          key="scoring_review_team")
+                    one_team = patterns[patterns["team_id"].astype(str)==chosen].copy()
+                    chart = one_team[["game_date", "points", "prior_ppg"]].set_index("game_date")
+                    st.line_chart(chart.rename(columns={"points": "Historical actual score",
+                                                        "prior_ppg": "Average before game"}))
+                    team_table = one_team[["game_date", "location", "games_before", "prior_ppg", "points",
+                                           "absolute_difference"]].rename(columns={
+                        "game_date": "Game date", "location": "Court", "games_before": "Earlier games",
+                        "prior_ppg": "Prior PPG", "points": "Actual points",
+                        "absolute_difference": "Difference from prior PPG"
+                    })
+                    show_table(team_table)
+                    st.download_button("Download team scoring history (CSV)",
+                                       team_table.to_csv(index=False),
+                                       f"ncaa_historical_scoring_{season}_{chosen}.csv", "text/csv",
+                                       key="scoring_review_csv")
+    st.caption("This page uses existing historical tables, does not change Supabase "
+               "records, and does not require a new workflow.")
 
 elif page == "Injuries":
     st.subheader("Official conference player availability")
