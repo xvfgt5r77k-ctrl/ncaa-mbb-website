@@ -689,12 +689,57 @@ def select_next_five_games(games: pd.DataFrame, now_utc: datetime) -> pd.DataFra
     return upcoming.head(5).drop(columns=["_tipoff_sort"])
 
 
+
+
+def historical_season_label(espn_end_year: int) -> str:
+    """ESPN IDs refer to the year in which the basketball season ends."""
+    year = int(espn_end_year)
+    return f"{year - 1}–{year % 100:02d}"
+
+
+def historical_rankings(rows: pd.DataFrame) -> pd.DataFrame:
+    """Assign national ranks BEFORE any Top-N display filter is applied."""
+    if rows.empty:
+        return rows.copy()
+    valid = rows.dropna(subset=["adj_net"]).copy()
+    valid["adj_net"] = pd.to_numeric(valid["adj_net"], errors="coerce")
+    valid = valid.dropna(subset=["adj_net"])
+    valid = valid.sort_values(
+        ["adj_net", "team", "team_id"],
+        ascending=[False, True, True], kind="stable"
+    ).reset_index(drop=True)
+    valid.insert(0, "national_rank", range(1, len(valid) + 1))
+    return valid
+
+
+def historical_trend_chart(snapshots: pd.DataFrame, metric: str,
+                           labels: dict[str, str]) -> pd.DataFrame:
+    """Align team snapshots on real dates without inventing missing game dates."""
+    if snapshots.empty:
+        return pd.DataFrame()
+    points = snapshots[["snapshot_date", "team_id", metric]].copy()
+    points["snapshot_date"] = pd.to_datetime(points["snapshot_date"], format="%Y-%m-%d", errors="coerce")
+    points[metric] = pd.to_numeric(points[metric], errors="coerce")
+    points["Team"] = points["team_id"].astype(str).map(labels)
+    points = points.dropna(subset=["snapshot_date", metric, "Team"])
+    if points.empty:
+        return pd.DataFrame()
+    return points.pivot_table(index="snapshot_date", columns="Team", values=metric,
+                              aggfunc="last").sort_index()
+
+
+def historical_number(value, signed: bool = False) -> str:
+    if value is None or pd.isna(value):
+        return "—"
+    return f"{float(value):+.1f}" if signed else f"{float(value):.1f}"
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -1105,6 +1150,255 @@ elif page == "Team explorer":
             if not graph.empty:
                 graph.columns = ['Offensive efficiency', 'Defensive efficiency']
                 st.line_chart(graph)
+
+elif page == "Historical Team Comparison":
+    st.subheader("Historical Team Comparison")
+    st.caption("Compare adjusted Division I team ratings using the five-season ESPN archive. "
+               "Choose the basketball season with the Season selector above. "
+               "All metrics come from completed games with usable ESPN box scores; "
+               "they are descriptive, not forecasts or official NCAA NET rankings.")
+    tables_exist = query("""
+        SELECT to_regclass('public.team_adjusted_ratings') IS NOT NULL AS ratings,
+               to_regclass('public.historical_team_snapshots') IS NOT NULL AS snapshots
+    """)
+    if (tables_exist.empty or not bool(tables_exist.iloc[0]["ratings"])
+            or not bool(tables_exist.iloc[0]["snapshots"])):
+        st.info("Historical ratings are not available yet. Run the existing "
+                "'Update NCAA MBB Adjusted SOS and History' workflow in GitHub Actions.")
+    else:
+        full_ratings = query("""
+            SELECT r.team_id, t.name AS team,
+                   COALESCE(t.conference, '—') AS conference,
+                   r.games_played AS gp,
+                   r.adjusted_offense AS adj_off,
+                   r.adjusted_defense AS adj_def,
+                   r.adjusted_net AS adj_net,
+                   r.opponent_sos AS opp_sos
+            FROM team_adjusted_ratings r
+            JOIN teams t ON t.team_id=r.team_id
+            WHERE r.season=%s AND t.is_d1=1
+            ORDER BY r.adjusted_net DESC, t.name ASC
+        """, (season,))
+        ranked = historical_rankings(full_ratings)
+        if ranked.empty:
+            st.info(f"No adjusted ratings are available for the "
+                    f"{historical_season_label(season)} season. Select an imported "
+                    "historical season above, or rerun the analytics workflow.")
+        else:
+            st.caption(f"**Selected season:** {historical_season_label(season)} · "
+                       f"{len(ranked):,} Division I teams rated")
+            ranking_tab, matchup_tab, trends_tab, years_tab = st.tabs([
+                "🏆 Top 25 rankings", "⚖️ Compare two teams",
+                "📈 Performance trends", "🗓️ Compare seasons"
+            ])
+            with ranking_tab:
+                st.markdown("#### Top 25 by adjusted net efficiency")
+                st.caption("Higher adjusted net is better. Adjusted defense is better "
+                           "when lower; SOS is higher for tougher opponents. "
+                           "National rank is computed across every rated D1 team, "
+                           "before displaying the top 25.")
+                top25 = ranked.head(25).rename(columns={
+                    "national_rank": "Rank", "team": "Team",
+                    "conference": "Conference", "gp": "GP",
+                    "adj_off": "Adj Off / 100", "adj_def": "Adj Def / 100",
+                    "adj_net": "Adj Net / 100", "opp_sos": "Opponent SOS"
+                })
+                top25 = top25[["Rank", "Team", "Conference", "GP", "Adj Off / 100",
+                               "Adj Def / 100", "Adj Net / 100", "Opponent SOS"]].copy()
+                for col in ["Adj Off / 100", "Adj Def / 100", "Adj Net / 100", "Opponent SOS"]:
+                    top25[col] = pd.to_numeric(top25[col], errors="coerce").round(1)
+                show_table(top25)
+                st.download_button("Download Top 25 (CSV)",
+                                   top25.to_csv(index=False),
+                                   f"ncaa_top25_adjusted_{season}.csv", "text/csv",
+                                   key="historical_top25_download")
+
+            # Both selectors are always constructed, so the following tabs
+            # reuse the same two teams. Team IDs (not names) identify rows.
+            selection = ranked[["team_id", "team", "conference"]].copy()
+            selection["team_id"] = selection["team_id"].astype(str)
+            choice_ids = selection["team_id"].tolist()
+            choice_labels = {
+                row["team_id"]: f"{row['team']} · {row['conference']}"
+                for _, row in selection.iterrows()
+            }
+            with matchup_tab:
+                st.markdown("#### Side-by-side team ratings")
+                left, right = st.columns(2)
+                with left:
+                    first_id = st.selectbox("Team A", choice_ids, index=0,
+                        format_func=lambda tid: choice_labels[tid],
+                        key="historical_compare_first")
+                with right:
+                    second_id = st.selectbox("Team B", choice_ids,
+                        index=min(1, len(choice_ids) - 1),
+                        format_func=lambda tid: choice_labels[tid],
+                        key="historical_compare_second")
+                if first_id == second_id:
+                    st.info("Select two different teams for a side-by-side comparison. "
+                            "The trends tab will display the selected team.")
+                compare_rows = ranked[ranked["team_id"].astype(str).isin(
+                    [first_id, second_id])]
+                by_id = {str(item["team_id"]): item
+                         for _, item in compare_rows.iterrows()}
+                # Pace is derived from the same completed, two-box-score games
+                # used by the analytics builder, not from all scheduled games.
+                pace_rows = query("""
+                    SELECT s.team_id, COUNT(*)::integer AS tempo_games,
+                           AVG(s.possessions)::double precision AS pace
+                    FROM team_game_stats s
+                    JOIN games g ON g.game_id=s.game_id
+                    JOIN team_game_stats o ON o.game_id=s.game_id
+                         AND o.team_id<>s.team_id
+                    WHERE g.season=%s AND g.completed=1
+                      AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+                      AND s.team_id IN (%s,%s)
+                      AND s.possessions>0 AND o.possessions>0
+                      AND s.points IS NOT NULL AND o.points IS NOT NULL
+                    GROUP BY s.team_id
+                """, (season, first_id, second_id))
+                pace_map = {str(item["team_id"]): item["pace"]
+                            for _, item in pace_rows.iterrows()}
+                compare_fields = [
+                    ("Adjusted offense / 100", "adj_off", False),
+                    ("Adjusted defense / 100 (lower is better)", "adj_def", False),
+                    ("Adjusted net / 100", "adj_net", True),
+                    ("Opponent SOS / 100", "opp_sos", True),
+                ]
+                comparison = []
+                for label, col, signed in compare_fields:
+                    comparison.append({
+                        "Statistic": label,
+                        choice_labels[first_id]: historical_number(by_id[first_id][col], signed),
+                        choice_labels[second_id]: historical_number(by_id[second_id][col], signed),
+                    })
+                for label, getter in [
+                    ("Games in ratings", lambda tid: str(int(by_id[tid]["gp"]))),
+                    ("Est. possessions / game", lambda tid: historical_number(
+                        pace_map.get(tid)))
+                ]:
+                    comparison.append({
+                        "Statistic": label,
+                        choice_labels[first_id]: getter(first_id),
+                        choice_labels[second_id]: getter(second_id),
+                    })
+                st.dataframe(pd.DataFrame(comparison), hide_index=True,
+                             use_container_width=True)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(f"{by_id[first_id]['team']} national rank",
+                              f"#{int(by_id[first_id]['national_rank'])}")
+                with col2:
+                    st.metric(f"{by_id[second_id]['team']} national rank",
+                              f"#{int(by_id[second_id]['national_rank'])}")
+                st.caption("Tempo is estimated possessions per game for imported "
+                           "completed games with box scores for both teams; it may "
+                           "differ from the rating's GP if any game is incomplete.")
+
+            with trends_tab:
+                st.markdown("#### Ratings across the selected season")
+                st.caption("Points are saved only on days when the team played. "
+                           "Each snapshot is an END-OF-DAY value, including that "
+                           "day's games—not a pregame rating.")
+                metrics = {
+                    "Adjusted net efficiency": "adjusted_net",
+                    "Adjusted offense": "adjusted_offense",
+                    "Adjusted defense": "adjusted_defense",
+                    "Opponent strength of schedule": "opponent_sos",
+                }
+                trend_choice = st.selectbox("Show metric", list(metrics),
+                                            key="historical_comparison_metric")
+                trend_rows = query("""
+                    SELECT snapshot_date, team_id, games_played,
+                           adjusted_offense, adjusted_defense,
+                           adjusted_net, opponent_sos
+                    FROM historical_team_snapshots
+                    WHERE season=%s AND team_id IN (%s,%s)
+                    ORDER BY snapshot_date, team_id
+                """, (season, first_id, second_id))
+                trend_names = {first_id: choice_labels[first_id],
+                               second_id: choice_labels[second_id]}
+                history_line = historical_trend_chart(
+                    trend_rows, metrics[trend_choice], trend_names)
+                if history_line.empty:
+                    st.info("No daily team-rating snapshots are stored for the "
+                            "selected teams and season.")
+                else:
+                    st.line_chart(history_line)
+                    downloadable = trend_rows.copy().rename(columns={
+                        "snapshot_date": "Date", "team_id": "Team ID",
+                        "games_played": "GP", "adjusted_offense": "Adj offense",
+                        "adjusted_defense": "Adj defense", "adjusted_net": "Adj net",
+                        "opponent_sos": "Opponent SOS"})
+                    show_table(downloadable)
+                    st.download_button("Download both teams' snapshots (CSV)",
+                                       downloadable.to_csv(index=False),
+                                       f"ncaa_team_trends_{season}.csv", "text/csv",
+                                       key="historical_compare_trend_download")
+
+            with years_tab:
+                st.markdown("#### One team's ratings across seasons")
+                all_teams = query("""
+                    SELECT DISTINCT r.team_id, t.name AS team
+                    FROM team_adjusted_ratings r
+                    JOIN teams t ON t.team_id=r.team_id
+                    WHERE t.is_d1=1
+                    ORDER BY t.name, r.team_id
+                """)
+                if all_teams.empty:
+                    st.info("No historical season ratings have been calculated yet.")
+                else:
+                    team_options = all_teams["team_id"].astype(str).tolist()
+                    team_labels = dict(zip(team_options, all_teams["team"].tolist()))
+                    index = team_options.index(first_id) if first_id in team_options else 0
+                    year_team_id = st.selectbox("Team for year-over-year comparison",
+                        team_options, index=index,
+                        format_func=lambda tid: team_labels[tid],
+                        key="historical_across_years_team")
+                    year_rows = query("""
+                        SELECT season, games_played AS gp,
+                               adjusted_offense AS adj_off,
+                               adjusted_defense AS adj_def,
+                               adjusted_net AS adj_net,
+                               opponent_sos AS opp_sos
+                        FROM team_adjusted_ratings
+                        WHERE team_id=%s
+                        ORDER BY season
+                    """, (year_team_id,))
+                    if year_rows.empty:
+                        st.info("No season ratings were found for this team.")
+                    else:
+                        display_years = year_rows.copy()
+                        display_years["Season"] = display_years["season"].map(
+                            historical_season_label)
+                        display_years = display_years.rename(columns={
+                            "gp": "GP", "adj_off": "Adj offense",
+                            "adj_def": "Adj defense", "adj_net": "Adj net",
+                            "opp_sos": "Opponent SOS"})
+                        display_years = display_years[["Season", "GP", "Adj offense",
+                            "Adj defense", "Adj net", "Opponent SOS"]]
+                        for metric_col in ["Adj offense", "Adj defense", "Adj net",
+                                           "Opponent SOS"]:
+                            display_years[metric_col] = pd.to_numeric(
+                                display_years[metric_col], errors="coerce").round(1)
+                        show_table(display_years)
+                        st.markdown("**Adjusted net efficiency by season**")
+                        net_line = display_years.set_index("Season")[["Adj net"]]
+                        st.line_chart(net_line)
+                        st.markdown("**Opponent strength of schedule by season**")
+                        sos_line = display_years.set_index("Season")[["Opponent SOS"]]
+                        st.line_chart(sos_line)
+                        st.download_button("Download season comparison (CSV)",
+                                           display_years.to_csv(index=False),
+                                           f"ncaa_years_{year_team_id}.csv", "text/csv",
+                                           key="historical_years_download")
+                        if len(display_years) < 2:
+                            st.caption("Only one season of analytics is available "
+                                       "for this team.")
+                st.caption("Conference labels in other tables reflect the teams' "
+                           "current imported conference metadata, not necessarily "
+                           "historical conference membership. Ratings include "
+                           "only games already imported with usable box scores.")
 
 elif page == "Historical team trends":
     st.subheader("Historical team efficiency & schedule trends")
