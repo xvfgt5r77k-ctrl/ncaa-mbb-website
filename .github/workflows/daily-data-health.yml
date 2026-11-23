@@ -1,0 +1,43 @@
+name: NCAA MBB Daily Data Health
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Independent of the ESPN importer: detects failed/missed nightly runs.
+    # Runs after the 3:37 AM CT import + adjusted-rating workflow.
+    - cron: '15 7 * * *'
+      timezone: 'America/Chicago'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ncaa-mbb-daily-health
+  cancel-in-progress: false
+
+jobs:
+  data-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out website
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install existing dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Refresh current-season pregame features
+        # A failed refresh must not prevent recording a health report.
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          SEASON=$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; d=datetime.now(ZoneInfo("America/Chicago")).date(); print(d.year + (d.month>=7))')
+          python pregame_quality.py --start-season "$SEASON" --end-season "$SEASON"
+      - name: Record latest database health
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python daily_data_health.py
