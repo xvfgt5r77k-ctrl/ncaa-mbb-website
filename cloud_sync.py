@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 
 from cloud_store import push_sqlite, database_url
 from pipeline import sync_range
+from injury_sync import sync_espn_injuries
 
 
 def parse_args():
@@ -50,6 +51,14 @@ def main():
             raise RuntimeError("ESPN sync failed; no cloud data was changed. Review the log.")
         counts = push_sqlite(Path(temporary)/"ingest.sqlite3", result=result)
         print("Published cloud rows:", counts)
+        # ESPN's college injury feed is optional and often empty. A temporary
+        # endpoint failure must never block the successfully imported game data.
+        try:
+            injury_count = sync_espn_injuries()
+            print(f"ESPN injury reports saved: {injury_count} (coverage may be limited)")
+        except Exception as exc:
+            logging.warning("ESPN injury refresh unavailable (%s); game import remains successful",
+                            type(exc).__name__)
         print(f"Sync status: {result['status']}; games={result['games']}; boxscores={result['boxscores']}")
         if result["errors"]:
             # Mark action as failed while retaining successful partial rows for the dashboard.
