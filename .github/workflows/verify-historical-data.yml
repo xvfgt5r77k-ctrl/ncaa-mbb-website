@@ -1,0 +1,39 @@
+name: Verify NCAA MBB Historical Pregame Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_season:
+        description: 'ESPN ending-year first season (e.g. 2022 = 2021-22)'
+        required: true
+        default: '2022'
+      end_season:
+        description: 'ESPN ending-year last completed season'
+        required: true
+        default: '2026'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ncaa-mbb-pregame-data-quality
+  cancel-in-progress: false
+
+jobs:
+  verify-historical-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Update historical coverage, strictly pregame features and scoring-baseline audit
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          START_SEASON: ${{ inputs.start_season || '2022' }}
+          END_SEASON: ${{ inputs.end_season || '2026' }}
+        run: python pregame_quality.py --start-season "$START_SEASON" --end-season "$END_SEASON"
