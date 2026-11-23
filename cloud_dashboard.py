@@ -2265,8 +2265,17 @@ try:
         st.info("No game records yet. After deployment, run the GitHub Actions importer once to populate your database.")
         st.stop()
     season_values = seasons["season"].astype(int).tolist()
-    season = st.selectbox("Season (ESPN ending year)", season_values)
     latest_season = season_values[0]
+    # The site's latest season can be newer than the verified historical snapshot.
+    # Limit this page's selector to years actually published in the fast view.
+    if page == "Verified Team Statistics":
+        published_seasons = query(
+            "SELECT DISTINCT season FROM public.ncaa_mbb_team_dashboard_fast_v1 "
+            "WHERE season IS NOT NULL ORDER BY season DESC"
+        )
+        if not published_seasons.empty:
+            season_values = published_seasons["season"].astype(int).tolist()
+    season = st.selectbox("Season (ESPN ending year)", season_values)
 except Exception as exc:
     # Log only a classified error category, not the raw exception: database
     # exceptions can occasionally contain credential-bearing connection details.
