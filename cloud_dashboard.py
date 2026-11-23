@@ -245,16 +245,27 @@ def current_roster_profiles(team_id: str) -> dict[str, dict]:
     return {str(player["id"]): player for player in athletes if player.get("id") is not None}
 
 
-def player_averages_display_rows(frame: pd.DataFrame, profiles: dict[str, dict]) -> pd.DataFrame:
-    """Add visible player jersey, height and weight without changing stat totals."""
+def player_averages_display_rows(frame: pd.DataFrame, profiles: dict[str, dict],
+                                 injury_by_player: dict[str, dict] | None = None) -> pd.DataFrame:
+    """Combine name/jersey/ESPN injury, plus roster height and weight."""
     shown = frame.copy()
+    injury_by_player = injury_by_player or {}
     visible_names = []
     heights = []
     weights = []
     for _, row in shown.iterrows():
         profile = profiles.get(str(row["player_id"]), {})
         number = _visible_jersey(row.get("jersey")) or _visible_jersey(profile.get("jersey"))
-        visible_names.append(str(row["player"]) + (f" #{number}" if number else ""))
+        visible_name = str(row["player"]) + (f" #{number}" if number else "")
+        report = injury_by_player.get(str(row["player_id"]))
+        if report:
+            injury_type = str(report.get("injury_detail") or "").strip()
+            injury_status = str(report.get("status") or "").strip()
+            description = (f"{injury_type} ({injury_status})" if injury_type and injury_status
+                           else injury_type or injury_status)
+            if description:
+                visible_name += f" ⛑️ {description}"
+        visible_names.append(visible_name)
         height = profile.get("displayHeight") or profile.get("height") or row.get("height_raw")
         weight = profile.get("displayWeight") or profile.get("weight") or row.get("weight_raw")
         heights.append(_display_height(height))
@@ -953,7 +964,8 @@ elif page == "Player season averages":
         st.caption(f"{len(filtered):,} players shown across "
                    f"{filtered['team'].nunique():,} teams. "
                    "GP = games played; MPG = minutes; PPG = points; RPG = rebounds; "
-                   "APG = assists; SPG = steals; BPG = blocks; TOPG = turnovers.")
+                   "APG = assists; SPG = steals; BPG = blocks; TOPG = turnovers. "
+                   "⛑️ means ESPN currently reports an injury; reports may be incomplete.")
         if filtered.empty:
             st.info("No players match your selected filters.")
         else:
@@ -965,7 +977,27 @@ elif page == "Player season averages":
             elif season == latest_season:
                 st.caption("Select one team to retrieve current roster height and weight "
                            "from ESPN. Missing details are shown as —.")
-            shown = player_averages_display_rows(filtered, profiles)
+            # Only annotate the current season. ESPN's injuries endpoint reflects
+            # current reports, not historical availability. Use a 72-hour freshness
+            # window so failed updates don't keep showing old injury labels.
+            injury_by_player = {}
+            if season == latest_season:
+                freshness_cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat(timespec="seconds")
+                injury_rows = query("""
+                    SELECT source_player_id, injury_detail, status, retrieved_at
+                    FROM injury_reports
+                    WHERE source = %s AND retrieved_at >= %s
+                      AND source_player_id IS NOT NULL
+                    ORDER BY retrieved_at DESC
+                """, ("ESPN", freshness_cutoff))
+                for _, injury in injury_rows.iterrows():
+                    player_id = str(injury["source_player_id"])
+                    if player_id not in injury_by_player:
+                        injury_by_player[player_id] = {
+                            "injury_detail": injury["injury_detail"],
+                            "status": injury["status"],
+                        }
+            shown = player_averages_display_rows(filtered, profiles, injury_by_player)
             renamed = shown.rename(columns={
                 "team": "Team", "player": "Player", "position": "Pos",
                 "height": "Height", "weight": "Weight",
@@ -981,14 +1013,28 @@ elif page == "Player season averages":
                                f"ncaa_player_season_averages_{season}.csv", "text/csv")
 
 elif page == "Injuries":
-    st.subheader("Injury reports")
-    st.warning("RotoWire injury reports are NOT connected yet. Missing entries do not mean players are healthy.")
+    st.subheader("ESPN-reported player injuries")
+    st.info("This page contains only injuries ESPN has reported, not a complete college "
+            "basketball availability list. No report does **not** mean a player is healthy.")
+    freshness_cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat(timespec="seconds")
     reports = query("""
-        SELECT player_name,team_name,status,injury_detail,expected_return,reported_at
-        FROM injury_reports ORDER BY retrieved_at DESC LIMIT 100
-    """)
-    if not reports.empty:
-        show_table(reports)
+        SELECT player_name,team_name,status,injury_detail,expected_return,reported_at,retrieved_at
+        FROM injury_reports
+        WHERE source = %s AND retrieved_at >= %s
+        ORDER BY retrieved_at DESC, player_name ASC LIMIT 500
+    """, ("ESPN", freshness_cutoff))
+    if reports.empty:
+        st.info("No recent injury entries were returned by ESPN. ESPN's men's college "
+                "basketball injury feed is often empty or incomplete.")
+    else:
+        st.caption(f"{len(reports):,} ESPN injury entries shown; most recent retrieval: "
+                   f"{reports['retrieved_at'].max()} UTC. Status and return estimates "
+                   "are ESPN reports, not independently verified.")
+        show_table(reports.rename(columns={
+            "player_name": "Player", "team_name": "Team", "status": "Status",
+            "injury_detail": "Injury", "expected_return": "Expected return",
+            "reported_at": "Reported", "retrieved_at": "Last checked (UTC)",
+        }))
 
 else:
     st.subheader("Cloud update status")
