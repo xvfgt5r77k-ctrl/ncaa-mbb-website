@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import logging
 import json
+import re
 from pathlib import Path
 from html import escape
 from datetime import datetime, timedelta, timezone
@@ -365,6 +366,102 @@ def current_ap_poll() -> tuple[dict[str, int], str]:
         return parse_ap_poll(response.json())
     except (requests.RequestException, ValueError, TypeError, KeyError):
         return {}, ""
+
+
+def parse_weekly_ap_poll(payload: dict) -> dict[str, int]:
+    """Parse ESPN Core's historical AP Top 25, where teams are $ref links.
+
+    Ranking source ID 1 is the AP poll. Do not substitute coaches rankings.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    name = str(payload.get("name") or payload.get("shortName") or "").lower()
+    if "coach" in name or (name and "ap" not in name.split()
+                          and "associated press" not in name):
+        return {}
+    ranks = {}
+    for row in payload.get("ranks", []):
+        if not isinstance(row, dict):
+            continue
+        team = row.get("team") or {}
+        if not isinstance(team, dict):
+            continue
+        team_id = team.get("id")
+        if team_id is None:
+            reference = str(team.get("$ref") or "")
+            match = re.search(r"/teams/([0-9]+)(?:[/?#]|$)", reference)
+            if match:
+                team_id = match.group(1)
+        try:
+            position = int(row.get("current"))
+        except (ValueError, TypeError):
+            continue
+        if team_id is not None and 1 <= position <= 25:
+            ranks[str(team_id)] = position
+    return ranks
+
+
+def core_rankings_weeks(payload: dict) -> list[int]:
+    """Find actual regular-season weeks; never guess a historical poll week."""
+    if not isinstance(payload, dict):
+        return []
+    weeks = set()
+    for item in payload.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("$ref") or "")
+        match = re.search(r"/weeks/([0-9]+)(?:[/?#]|$)", ref)
+        if match:
+            weeks.add(int(match.group(1)))
+    return sorted(weeks, reverse=True)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def historical_ap_poll(espn_end_year: int) -> tuple[dict[str, int], str]:
+    """Most recent *available regular-season* AP poll from the selected year.
+
+    ESPN Core exposes archived polls by season and week. When unavailable,
+    return no ranking rather than showing an unrelated current-year AP poll.
+    """
+    base = ("https://sports.core.api.espn.com/v2/sports/basketball/"
+            "leagues/mens-college-basketball/seasons/"
+            f"{int(espn_end_year)}/types/2")
+    headers = {"Accept": "application/json", "User-Agent": "NCAA-MBB-Dashboard/1.0"}
+    try:
+        response = requests.get(f"{base}/weeks?limit=200", timeout=7,
+                                headers=headers)
+        response.raise_for_status()
+        weeks = core_rankings_weeks(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        return {}, ""
+    # Later weeks can lack AP polls; try up to eight of the most recent weeks.
+    for week in weeks[:8]:
+        try:
+            response = requests.get(
+                f"{base}/weeks/{week}/rankings/1", timeout=5, headers=headers)
+            response.raise_for_status()
+            rankings = parse_weekly_ap_poll(response.json())
+            if rankings:
+                return rankings, f"ESPN AP Top 25, regular-season week {week}"
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+    return {}, ""
+
+
+def comparison_ap_poll(season: int, latest_season: int) -> tuple[dict[str, int], str]:
+    """Current AP for current year, season-specific archived AP for older years."""
+    if int(season) == int(latest_season):
+        ranks, name = current_ap_poll()
+        return ranks, f"Current {name or 'AP Top 25'}" if ranks else ""
+    return historical_ap_poll(int(season))
+
+
+def comparison_team_name(name: str, conference: str, team_id,
+                         ap_ranks: dict[str, int], poll_found: bool) -> str:
+    """Streamlit selectboxes support text; logos appear in linked team cells."""
+    rank = ap_ranks.get(str(team_id))
+    prefix = (f"AP #{rank} " if rank is not None else "NR " if poll_found else "")
+    return f"{prefix}{name} · {conference}"
 
 
 def rank_maps(season: int, latest_season: int) -> tuple[dict[str, int], dict[str, int], pd.DataFrame]:
@@ -1167,7 +1264,7 @@ elif page == "Historical Team Comparison":
                 "'Update NCAA MBB Adjusted SOS and History' workflow in GitHub Actions.")
     else:
         full_ratings = query("""
-            SELECT r.team_id, t.name AS team,
+            SELECT r.team_id, t.name AS team, t.logo_url,
                    COALESCE(t.conference, '—') AS conference,
                    r.games_played AS gp,
                    r.adjusted_offense AS adj_off,
@@ -1185,8 +1282,18 @@ elif page == "Historical Team Comparison":
                     f"{historical_season_label(season)} season. Select an imported "
                     "historical season above, or rerun the analytics workflow.")
         else:
+            ap_for_comparison, ap_poll_name = comparison_ap_poll(season, latest_season)
             st.caption(f"**Selected season:** {historical_season_label(season)} · "
                        f"{len(ranked):,} Division I teams rated")
+            if ap_for_comparison:
+                st.caption(f"Team names display AP rank → ESPN logo → name. "
+                           f"AP source: {ap_poll_name}. 'NR' means outside the AP Top 25. "
+                           "The AP poll is separate from our adjusted-efficiency ranking; "
+                           "historical AP positions are NOT game-day rankings.")
+            else:
+                st.caption("ESPN AP rankings for this selected season are unavailable. "
+                           "Team logos and names remain visible; adjusted-efficiency "
+                           "rankings still work normally.")
             ranking_tab, matchup_tab, trends_tab, years_tab = st.tabs([
                 "🏆 Top 25 rankings", "⚖️ Compare two teams",
                 "📈 Performance trends", "🗓️ Compare seasons"
@@ -1207,7 +1314,24 @@ elif page == "Historical Team Comparison":
                                "Adj Def / 100", "Adj Net / 100", "Opponent SOS"]].copy()
                 for col in ["Adj Off / 100", "Adj Def / 100", "Adj Net / 100", "Opponent SOS"]:
                     top25[col] = pd.to_numeric(top25[col], errors="coerce").round(1)
-                show_table(top25)
+                top25_html = []
+                for _, team_row in ranked.head(25).iterrows():
+                    top25_html.append([
+                        safe_cell(int(team_row["national_rank"])),
+                        team_badge(team_row["team"], team_row["team_id"],
+                                   team_row["logo_url"], ap_for_comparison),
+                        safe_cell(team_row["conference"]),
+                        safe_cell(int(team_row["gp"])),
+                        historical_number(team_row["adj_off"]),
+                        historical_number(team_row["adj_def"]),
+                        historical_number(team_row["adj_net"], signed=True),
+                        historical_number(team_row["opp_sos"], signed=True),
+                    ])
+                show_visual_table(["Adj rank", "Team (AP rank · logo · name)",
+                                   "Conference", "GP", "Adj Off / 100", "Adj Def / 100",
+                                   "Adj Net / 100", "Opponent SOS"], top25_html)
+                st.caption("Adj rank is computed from adjusted net efficiency; "
+                           "AP # beside a logo is from the Associated Press poll.")
                 st.download_button("Download Top 25 (CSV)",
                                    top25.to_csv(index=False),
                                    f"ncaa_top25_adjusted_{season}.csv", "text/csv",
@@ -1215,11 +1339,13 @@ elif page == "Historical Team Comparison":
 
             # Both selectors are always constructed, so the following tabs
             # reuse the same two teams. Team IDs (not names) identify rows.
-            selection = ranked[["team_id", "team", "conference"]].copy()
+            selection = ranked[["team_id", "team", "conference", "logo_url"]].copy()
             selection["team_id"] = selection["team_id"].astype(str)
             choice_ids = selection["team_id"].tolist()
             choice_labels = {
-                row["team_id"]: f"{row['team']} · {row['conference']}"
+                row["team_id"]: comparison_team_name(
+                    row["team"], row["conference"], row["team_id"],
+                    ap_for_comparison, bool(ap_for_comparison))
                 for _, row in selection.iterrows()
             }
             with matchup_tab:
@@ -1229,11 +1355,21 @@ elif page == "Historical Team Comparison":
                     first_id = st.selectbox("Team A", choice_ids, index=0,
                         format_func=lambda tid: choice_labels[tid],
                         key="historical_compare_first")
+                    first_display = ranked.loc[
+                        ranked["team_id"].astype(str) == first_id].iloc[0]
+                    st.markdown('<div class="mbb-team-card">' + team_badge(
+                        first_display["team"], first_id, first_display["logo_url"],
+                        ap_for_comparison) + '</div>', unsafe_allow_html=True)
                 with right:
                     second_id = st.selectbox("Team B", choice_ids,
                         index=min(1, len(choice_ids) - 1),
                         format_func=lambda tid: choice_labels[tid],
                         key="historical_compare_second")
+                    second_display = ranked.loc[
+                        ranked["team_id"].astype(str) == second_id].iloc[0]
+                    st.markdown('<div class="mbb-team-card">' + team_badge(
+                        second_display["team"], second_id, second_display["logo_url"],
+                        ap_for_comparison) + '</div>', unsafe_allow_html=True)
                 if first_id == second_id:
                     st.info("Select two different teams for a side-by-side comparison. "
                             "The trends tab will display the selected team.")
@@ -1265,25 +1401,27 @@ elif page == "Historical Team Comparison":
                     ("Adjusted net / 100", "adj_net", True),
                     ("Opponent SOS / 100", "opp_sos", True),
                 ]
-                comparison = []
+                comparison = [[
+                    "Team",
+                    team_badge(by_id[first_id]["team"], first_id,
+                               by_id[first_id]["logo_url"], ap_for_comparison),
+                    team_badge(by_id[second_id]["team"], second_id,
+                               by_id[second_id]["logo_url"], ap_for_comparison),
+                ]]
                 for label, col, signed in compare_fields:
-                    comparison.append({
-                        "Statistic": label,
-                        choice_labels[first_id]: historical_number(by_id[first_id][col], signed),
-                        choice_labels[second_id]: historical_number(by_id[second_id][col], signed),
-                    })
+                    comparison.append([
+                        safe_cell(label),
+                        historical_number(by_id[first_id][col], signed),
+                        historical_number(by_id[second_id][col], signed),
+                    ])
                 for label, getter in [
                     ("Games in ratings", lambda tid: str(int(by_id[tid]["gp"]))),
                     ("Est. possessions / game", lambda tid: historical_number(
                         pace_map.get(tid)))
                 ]:
-                    comparison.append({
-                        "Statistic": label,
-                        choice_labels[first_id]: getter(first_id),
-                        choice_labels[second_id]: getter(second_id),
-                    })
-                st.dataframe(pd.DataFrame(comparison), hide_index=True,
-                             use_container_width=True)
+                    comparison.append([safe_cell(label), getter(first_id),
+                                       getter(second_id)])
+                show_visual_table(["Statistic", "Team A", "Team B"], comparison)
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric(f"{by_id[first_id]['team']} national rank",
