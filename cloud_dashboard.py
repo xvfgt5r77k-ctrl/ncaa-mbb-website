@@ -126,7 +126,7 @@ def load_verified_team_history() -> pd.DataFrame:
                win_percentage, avg_points_scored, avg_points_allowed,
                avg_scoring_margin, home_games, away_games, neutral_games
         FROM public.ncaa_mbb_team_dashboard_fast_v1
-        WHERE season BETWEEN 2022 AND 2026
+        WHERE season >= 2022
         ORDER BY season, team_name
     """)
     if not frame.empty:
@@ -2309,8 +2309,8 @@ except Exception as exc:
 if page == "Verified Team Statistics":
     st.subheader("Verified historical team statistics")
     st.caption(
-        "Browse qualified historical NCAA men's basketball results. The 2022–2026 "
-        "records include only games where both teams had five or more prior usable "
+        "Browse qualified NCAA men's basketball results for seasons 2022–"
+        f"{max(season_values)}. Records include only games where both teams had five or more prior usable "
         "games and passed the basic box-score checks. These are NOT official "
         "full-season standings or forecasts."
     )
@@ -2362,8 +2362,9 @@ if page == "Verified Team Statistics":
                 )
             with filter_c:
                 minimum_games = st.slider(
-                    "Minimum qualified games", 0, 35, 5,
-                    key="verified_min_games",
+                    "Minimum qualified games", 0, 35,
+                    value=1 if season == max(season_values) else 5,
+                    key=f"verified_min_games_{season}",
                 )
             displayed = verified.loc[
                 verified["games_analyzed"] >= minimum_games
@@ -2485,7 +2486,7 @@ if page == "Verified Team Statistics":
                 all_seasons = load_verified_team_history()
             except Exception as exc:
                 logging.warning("Season trends unavailable: %s", type(exc).__name__)
-                st.warning("The five-season summary is temporarily unavailable.")
+                st.warning("The multi-season summary is temporarily unavailable.")
             else:
                 if all_seasons.empty:
                     st.info("No historical team statistics available.")
