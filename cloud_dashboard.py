@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import logging
+import json
+from pathlib import Path
 from html import escape
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -638,6 +640,32 @@ def load_schedule(season: int, start_date: str, end_date: str) -> pd.DataFrame:
     return query(SCHEDULE_QUERY, (season, start_date, end_date))
 
 
+def select_next_five_games(games: pd.DataFrame, now_utc: datetime) -> pd.DataFrame:
+    """Pick the next five not-yet-started games from ESPN's imported schedule.
+
+    The `completed=0` SQL filter alone also includes games in progress, so
+    exclude any match whose known UTC tipoff has already passed. Missing
+    tipoff times are kept as TBD unless the game has already started.
+    """
+    if games.empty:
+        return games.copy()
+    upcoming = games.copy()
+    tipoffs = pd.to_datetime(upcoming["start_time_utc"], errors="coerce", utc=True)
+    current_time = pd.Timestamp(now_utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.tz_localize("UTC")
+    else:
+        current_time = current_time.tz_convert("UTC")
+    upcoming = upcoming.loc[tipoffs.isna() | (tipoffs > current_time)].copy()
+    if upcoming.empty:
+        return upcoming
+    upcoming["_tipoff_sort"] = pd.to_datetime(upcoming["start_time_utc"],
+                                               errors="coerce", utc=True)
+    upcoming = upcoming.sort_values(["game_date", "_tipoff_sort", "game_id"],
+                                    kind="stable", na_position="last")
+    return upcoming.head(5).drop(columns=["_tipoff_sort"])
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • unadjusted, possession-based efficiency • Central Time")
 with st.sidebar:
@@ -872,6 +900,49 @@ elif page == "Team explorer":
         st.caption(f"Conference: {conference_name} · "
                    f"Season efficiency rank: {rank_label(team_id, efficiency_ranks)} · "
                    "Records are based on imported final scores.")
+        st.markdown("#### Next 5 games")
+        # Use this season's imported future schedule; never fabricate games.
+        # The nightly ESPN update normally imports 14 days ahead.
+        upcoming_games = query("""
+            SELECT g.game_id, g.game_date, g.start_time_utc,
+                   g.home_team_id, g.away_team_id, g.venue,
+                   CASE WHEN g.home_team_id=%s THEN a.team_id ELSE h.team_id END AS opponent_id,
+                   CASE WHEN g.home_team_id=%s THEN a.name ELSE h.name END AS opponent,
+                   CASE WHEN g.home_team_id=%s THEN a.logo_url ELSE h.logo_url END AS opponent_logo
+            FROM games g
+            JOIN teams h ON h.team_id=g.home_team_id
+            JOIN teams a ON a.team_id=g.away_team_id
+            WHERE (g.home_team_id=%s OR g.away_team_id=%s)
+              AND g.season=%s AND g.completed=0 AND g.game_date >= %s
+            ORDER BY g.game_date ASC, g.start_time_utc ASC NULLS LAST, g.game_id ASC
+        """, (team_id, team_id, team_id, team_id, team_id, season,
+              datetime.now(CENTRAL).date().isoformat()))
+        upcoming_games = select_next_five_games(upcoming_games, datetime.now(timezone.utc))
+        if upcoming_games.empty:
+            st.info("No upcoming games have been imported for this team. "
+                    "The nightly ESPN update normally imports the next 14 days. "
+                    "Try running the GitHub Actions updater with both date fields blank.")
+        else:
+            st.caption("Upcoming games from the imported ESPN schedule. "
+                       "Opponent W–L is their current overall record; start times are Central.")
+            upcoming_rows = []
+            for _, game in upcoming_games.iterrows():
+                is_home = str(game["home_team_id"]) == team_id
+                upcoming_rows.append([
+                    safe_cell(game["game_date"]),
+                    safe_cell(central_tipoff(game["start_time_utc"])),
+                    "vs" if is_home else "@",
+                    team_badge(game["opponent"], game["opponent_id"],
+                               game["opponent_logo"], ap_ranks, records),
+                    safe_cell(game["venue"]),
+                ])
+            show_visual_table(["Date", "Time (CT)", "Home/Away", "Opponent", "Venue"],
+                              upcoming_rows)
+            if len(upcoming_games) < 5:
+                st.caption(f"Only {len(upcoming_games)} future game(s) currently in the database. "
+                           "Additional games will appear as the ESPN updater imports them.")
+
+        st.markdown("#### Previous games")
         games = query("""
             SELECT g.game_id, g.game_date, g.home_team_id, g.away_team_id,
                    g.home_score, g.away_score,
@@ -1031,6 +1102,23 @@ elif page == "Injuries":
         "[Big 12](https://big12sports.com/sports/2026/1/1/MBBreporting.aspx) · "
         "[Big East](https://www.bigeast.com/news/2025/12/12/general-big-east-to-provide-public-availability-reports-for-mens-and-womens-basketball.aspx)"
     )
+    # Automatically monitored publication links: these are not player statuses.
+    index_path = Path(__file__).resolve().parent / "data" / "conference_report_index.json"
+    if index_path.is_file():
+        try:
+            source_index = json.loads(index_path.read_text(encoding="utf-8"))
+            with st.expander("Latest official report links (checked automatically)", expanded=False):
+                st.caption("Last link check: " + str(source_index.get("checked_at", "Unknown"))
+                           + " UTC. Embedded report viewers may have no directly linked documents. "
+                           + "These links do not confirm any player is injured or unavailable.")
+                for conference_name, source in source_index.get("sources", {}).items():
+                    st.markdown(f"**{escape(conference_name)}** — "
+                                f"[{source.get('status', 'unknown')}]({source.get('page', '#')})")
+                    for entry in source.get("links", [])[:8]:
+                        st.markdown(f"- [{escape(entry.get('title', 'Official report'))}]"
+                                    f"({entry.get('url', '#')})")
+        except (OSError, ValueError, TypeError):
+            st.caption("Official report link index is not available yet.")
     today_central = datetime.now(CENTRAL).date()
     left, right = st.columns(2)
     with left:
