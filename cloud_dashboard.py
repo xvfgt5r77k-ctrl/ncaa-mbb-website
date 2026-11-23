@@ -168,6 +168,29 @@ ORDER BY LOWER(team), ppg DESC, LOWER(player)
 """
 
 
+# Team Explorer: season-to-date per-game averages, using completed games for
+# which ESPN supplied an actual team box score. Shooting percentages are based
+# on combined season makes/attempts, not the mean of game percentages.
+TEAM_SEASON_AVERAGES_QUERY = """
+SELECT COUNT(*)::integer AS gp,
+       ROUND(AVG(s.points)::numeric, 1)::double precision AS ppg,
+       ROUND(AVG(o.points)::numeric, 1)::double precision AS opp_ppg,
+       ROUND(AVG(s.rebounds)::numeric, 1)::double precision AS rpg,
+       ROUND(AVG(s.assists)::numeric, 1)::double precision AS apg,
+       ROUND(AVG(s.steals)::numeric, 1)::double precision AS spg,
+       ROUND(AVG(s.blocks)::numeric, 1)::double precision AS bpg,
+       ROUND(AVG(s.turnovers)::numeric, 1)::double precision AS topg,
+       ROUND(100.0 * SUM(s.fg_m) / NULLIF(SUM(s.fg_a), 0), 1)::double precision AS fg_pct,
+       ROUND(100.0 * SUM(s.three_m) / NULLIF(SUM(s.three_a), 0), 1)::double precision AS three_pct,
+       ROUND(100.0 * SUM(s.ft_m) / NULLIF(SUM(s.ft_a), 0), 1)::double precision AS ft_pct
+FROM team_game_stats s
+JOIN games g ON g.game_id = s.game_id
+LEFT JOIN team_game_stats o ON o.game_id = s.game_id AND o.team_id <> s.team_id
+WHERE s.team_id = %s AND g.season = %s AND g.completed = 1
+  AND s.points IS NOT NULL
+"""
+
+
 def show_table(frame: pd.DataFrame, columns: list[str] | None = None):
     st.dataframe(frame[columns] if columns else frame, use_container_width=True,
                  hide_index=True)
@@ -900,6 +923,26 @@ elif page == "Team explorer":
         st.caption(f"Conference: {conference_name} · "
                    f"Season efficiency rank: {rank_label(team_id, efficiency_ranks)} · "
                    "Records are based on imported final scores.")
+        st.markdown("#### Team season averages")
+        team_averages = query(TEAM_SEASON_AVERAGES_QUERY, (team_id, season))
+        if team_averages.empty or int(team_averages.iloc[0]["gp"]) == 0:
+            st.info("No completed team box scores have been imported for this season yet.")
+        else:
+            st.caption("Per-game averages from completed ESPN team box scores. "
+                       "GP may differ from the overall W–L record if a game is missing "
+                       "its box score. Shooting percentages use season totals of "
+                       "made shots divided by attempted shots.")
+            season_summary = team_averages.iloc[0]
+            fields = [
+                ("GP", "gp"), ("PPG", "ppg"), ("Opp PPG", "opp_ppg"),
+                ("RPG", "rpg"), ("APG", "apg"), ("SPG", "spg"),
+                ("BPG", "bpg"), ("TO/G", "topg"),
+                ("FG%", "fg_pct"), ("3P%", "three_pct"), ("FT%", "ft_pct"),
+            ]
+            show_visual_table([title for title, _ in fields],
+                              [[safe_cell(season_summary[field])
+                                for _, field in fields]])
+
         st.markdown("#### Next 5 games")
         # Use this season's imported future schedule; never fabricate games.
         # The nightly ESPN update normally imports 14 days ahead.
