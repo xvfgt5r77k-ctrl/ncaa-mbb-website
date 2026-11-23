@@ -20,6 +20,42 @@ st.set_page_config(page_title="NCAA MBB | Game Schedules & Stats", page_icon="�
 CENTRAL = ZoneInfo("America/Chicago")
 
 
+
+# Consistent white page, black text/borders and soft-gray control/card surfaces.
+# This is applied from the Python entrypoint, so no second GitHub file is needed.
+st.markdown("""
+<style>
+  :root { color-scheme: light !important; }
+  html, body, .stApp, [data-testid="stAppViewContainer"],
+  [data-testid="stHeader"], [data-testid="stMain"],
+  [data-testid="stMainBlockContainer"] { background: #FFFFFF !important; color: #111111 !important; }
+  .stApp, .stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3,
+  .stApp h4, .stApp h5, .stApp h6,
+  .stApp [data-testid="stMarkdownContainer"] { color: #111111 !important; }
+  [data-testid="stSidebar"], [data-testid="stSidebarContent"] {
+    background: #F2F3F5 !important; color: #111111 !important;
+  }
+  [data-testid="stMetric"], [data-testid="stVerticalBlockBorderWrapper"] > div,
+  [data-testid="stAlert"] { background-color: #F6F6F6; color: #111111; border-radius: 8px; }
+  [data-baseweb="select"] > div, [data-baseweb="input"] > div,
+  [data-testid="stNumberInput"] input,
+  .stApp input, .stApp textarea, .stApp button {
+    background: #F4F4F4 !important; color: #111111 !important;
+    border-color: #4A4A4A !important;
+  }
+  .stApp button:hover { background: #E7E7E7 !important; }
+  [data-testid="stDataFrame"] { border: 1px solid #333333; border-radius: 8px; }
+  .stApp a { color: #111111 !important; text-decoration: underline; }
+  .mbb-team-card { display: inline-block; background: #F3F3F3;
+                   border: 1px solid #333333; padding: 12px 16px;
+                   border-radius: 9px; margin: 7px 0 12px; }
+  .mbb-record { background: #E5E7EB; border: 1px solid #555;
+                border-radius: 5px; padding: 3px 6px; font-size: .8rem;
+                font-weight: 650; color: #111; margin-left: 5px; }
+  .mbb-result { font-weight: 800; color: #111; margin-right: 6px; }
+</style>
+""", unsafe_allow_html=True)
+
 @st.cache_resource(show_spinner=False)
 def get_database_url() -> str:
     url = os.getenv("DATABASE_URL", "")
@@ -303,6 +339,134 @@ def rank_maps(season: int, latest_season: int) -> tuple[dict[str, int], dict[str
     return efficiency, ap, rankings
 
 
+
+# Overall W-L records are based on all imported completed games with final scores,
+# not just games with complete team-box-score statistics.
+SEASON_RECORDS_QUERY = """
+SELECT team_id, SUM(wins)::integer AS wins, SUM(losses)::integer AS losses
+FROM (
+    SELECT home_team_id AS team_id,
+           CASE WHEN home_score > away_score THEN 1 ELSE 0 END AS wins,
+           CASE WHEN home_score < away_score THEN 1 ELSE 0 END AS losses
+    FROM games WHERE season=%s AND completed=1
+      AND home_score IS NOT NULL AND away_score IS NOT NULL
+    UNION ALL
+    SELECT away_team_id AS team_id,
+           CASE WHEN away_score > home_score THEN 1 ELSE 0 END AS wins,
+           CASE WHEN away_score < home_score THEN 1 ELSE 0 END AS losses
+    FROM games WHERE season=%s AND completed=1
+      AND home_score IS NOT NULL AND away_score IS NOT NULL
+) completed_games
+GROUP BY team_id
+"""
+
+
+def season_records(season: int) -> dict[str, tuple[int, int]]:
+    frame = query(SEASON_RECORDS_QUERY, (season, season))
+    return {str(row['team_id']): (int(row['wins']), int(row['losses']))
+            for _, row in frame.iterrows()}
+
+
+def record_label(team_id, records: dict[str, tuple[int, int]]) -> str:
+    record = records.get(str(team_id))
+    return f"{record[0]}–{record[1]}" if record else "—"
+
+
+def parse_conference_standings(payload: dict) -> dict[str, int]:
+    """Read ESPN's conference-group standings (not an overall league ranking).
+
+    The ESPN level=3 response nests conference groups under `children`, each
+    with ordered `standings.entries`. No team gets a fabricated official rank.
+    """
+    result: dict[str, int] = {}
+
+    def visit(node, depth=0):
+        if not isinstance(node, dict) or depth > 6:
+            return
+        children = node.get('children') or []
+        if not isinstance(children, list):
+            children = []
+        standings = node.get('standings') or {}
+        entries = standings.get('entries') if isinstance(standings, dict) else None
+        # Only assign positions at conference level, NOT the root all-D1 group.
+        group_name = str(node.get('name') or '').strip().lower()
+        group_id = str(node.get('id') or node.get('groupId') or '')
+        is_league_root = (group_id == '50' or
+                          group_name in ('ncaa division i', 'division i',
+                                         'mens college basketball', "men's college basketball"))
+        if isinstance(entries, list) and entries and not is_league_root and not children:
+            rank = 0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                team = entry.get('team') or {}
+                ident = team.get('id') if isinstance(team, dict) else None
+                if ident is None:
+                    continue
+                rank += 1
+                result[str(ident)] = rank
+        for child in children:
+            visit(child, depth + 1)
+
+    visit(payload)
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def espn_conference_positions(season: int) -> dict[str, int]:
+    """Conference standings positions from ESPN, one public request per hour."""
+    endpoint = ("https://site.web.api.espn.com/apis/v2/sports/"
+                "basketball/mens-college-basketball/standings")
+    try:
+        response = requests.get(endpoint, params={
+            'region': 'us', 'lang': 'en', 'contentorigin': 'espn',
+            'season': season, 'group': 50, 'type': 0, 'level': 3,
+            'sort': ('leaguewinpercent:desc,vsconf_winpercent:desc,'
+                     'vsconf_gamesbehind:asc,vsconf_playoffseed:asc,'
+                     'wins:desc,losses:asc,alpha:asc'),
+        }, timeout=12, headers={'Accept': 'application/json',
+                                'User-Agent': 'NCAA-MBB-Dashboard/1.0'})
+        response.raise_for_status()
+        return parse_conference_standings(response.json())
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return {}
+
+
+def sort_conference_teams(teams: pd.DataFrame, positions: dict[str, int],
+                          records: dict[str, tuple[int, int]]) -> pd.DataFrame:
+    """Group by conference; ESPN standings order, then clearly marked fallback."""
+    shown = teams.copy()
+    shown['sort_conference'] = shown['Conference'].str.casefold().map(
+        lambda c: 'zzzz' if c == '—' else c)
+    shown['official_rank'] = shown['team_id'].map(lambda x: positions.get(str(x)))
+    shown['sort_missing'] = shown['official_rank'].isna().astype(int)
+    shown['win_pct'] = shown['team_id'].map(
+        lambda ident: (records.get(str(ident), (0, 0))[0] /
+                       max(1, sum(records.get(str(ident), (0, 0))))))
+    shown['wins_for_sort'] = shown['team_id'].map(
+        lambda ident: records.get(str(ident), (0, 0))[0])
+    # When ESPN is unavailable, order teams in each conference by overall W-L,
+    # but do not label that an official conference standing.
+    return shown.sort_values(
+        ['sort_conference', 'sort_missing', 'official_rank', 'win_pct',
+         'wins_for_sort', 'name'],
+        ascending=[True, True, True, False, False, True],
+        na_position='last', kind='stable')
+
+
+def matchup_result(game: pd.Series, selected_id: str) -> str:
+    """W/L and score from the chosen team's viewpoint, not home-team first."""
+    is_home = str(game['home_team_id']) == str(selected_id)
+    ours = game['home_score'] if is_home else game['away_score']
+    theirs = game['away_score'] if is_home else game['home_score']
+    if pd.isna(ours) or pd.isna(theirs):
+        return '—'
+    ours, theirs = int(ours), int(theirs)
+    result = 'W' if ours > theirs else ('L' if ours < theirs else 'T')
+    return (f'<span class="mbb-result">{result}</span>'
+            f'{safe_cell(ours)}–{safe_cell(theirs)}')
+
+
 def logo_url(value) -> str:
     """Only display valid remote HTTPS logo links already stored by the importer."""
     return value if isinstance(value, str) and value.startswith("https://") else ""
@@ -375,7 +539,8 @@ def safe_cell(value) -> str:
     return escape(str(value))
 
 
-def team_badge(name, team_id, image_url, ap_ranks: dict[str, int]) -> str:
+def team_badge(name, team_id, image_url, ap_ranks: dict[str, int],
+               records: dict[str, tuple[int, int]] | None = None) -> str:
     """A single team cell in the order AP rank → team logo → team name."""
     position = ap_ranks.get(str(team_id))
     ap = (f'<span class="mbb-ap">#{int(position)}</span>' if position is not None
@@ -384,8 +549,11 @@ def team_badge(name, team_id, image_url, ap_ranks: dict[str, int]) -> str:
     picture = (f'<img class="mbb-team-logo" src="{escape(url, quote=True)}" '
                'width="26" height="26" loading="lazy" alt="">' if url
                else '<span class="mbb-logo-placeholder" aria-hidden="true"></span>')
+    record_html = (f'<span class="mbb-record">{record_label(team_id, records)}</span>'
+                   if records is not None else '')
     return (f'<span class="mbb-team">{ap}{picture}'
-            f'<span class="mbb-team-name">{safe_cell(name)}</span></span>')
+            f'<span class="mbb-team-name">{safe_cell(name)}</span>'
+            f'{record_html}</span>')
 
 
 def conference_badge(name, conference_logos: dict[str, str]) -> str:
@@ -407,16 +575,17 @@ def show_visual_table(headers: list[str], rows: list[list[str]]) -> None:
     """
     css = """
     <style>
-      .mbb-table-scroll {width:100%; overflow-x:auto; border:1px solid rgba(128,128,128,.25);
+      .mbb-table-scroll {width:100%; overflow-x:auto; border:1px solid #333333;
                          border-radius:9px; margin:.5rem 0 1.1rem;}
-      table.mbb-table {border-collapse:collapse; width:100%; min-width:790px; font-size:.88rem;}
+      table.mbb-table {border-collapse:collapse; width:100%; min-width:790px;
+                       font-size:.88rem; background:#F4F4F4; color:#111111;}
       .mbb-table th {padding:10px 12px; text-align:left; white-space:nowrap;
-                     background:rgba(128,128,128,.09); font-weight:650;
-                     border-bottom:1px solid rgba(128,128,128,.25);}
+                     background:#E6E6E6; color:#111111; font-weight:650;
+                     border-bottom:1px solid #333333;}
       .mbb-table td {padding:9px 12px; white-space:nowrap; vertical-align:middle;
-                     border-bottom:1px solid rgba(128,128,128,.15);}
+                     border-bottom:1px solid #B8B8B8; color:#111111;}
       .mbb-table tr:last-child td {border-bottom:0;}
-      .mbb-table tbody tr:hover {background:rgba(128,128,128,.08);}
+      .mbb-table tbody tr:hover {background:#E7E7E7;}
       .mbb-team {display:inline-flex; align-items:center; gap:7px; min-width:155px;}
       .mbb-ap {display:inline-block; min-width:28px; font-weight:700; font-size:.84rem;}
       .mbb-team-logo {width:26px; height:26px; object-fit:contain; flex:0 0 26px;}
@@ -579,6 +748,8 @@ elif page == "Teams & conferences":
         except Exception:
             efficiency_ranks, ap_ranks = {}, {}
             st.warning("Efficiency ranks are temporarily unavailable.")
+        records = season_records(season)
+        positions = espn_conference_positions(season)
         teams["Conference"] = teams["conference"].fillna("—").replace("", "—")
         search_col, conference_col = st.columns([2, 1])
         with search_col:
@@ -590,19 +761,31 @@ elif page == "Teams & conferences":
             teams = teams[teams["name"].str.contains(search, case=False, regex=False, na=False)]
         if conference != "All conferences":
             teams = teams[teams["Conference"] == conference]
-        st.caption(f"{len(teams)} Division I teams shown · AP rank → team logo → name · "
-                   "Eff. = season net-efficiency ranking")
+        st.caption(f"{len(teams)} Division I teams shown · AP rank → team logo → name → "
+                   "overall record (from imported final scores).")
+        if positions:
+            st.caption("Sorted by conference, then ESPN's conference standings rank "
+                       "(when available). Teams without ESPN positions appear afterward "
+                       "in overall-record order.")
+        else:
+            st.warning("ESPN conference standings aren't available right now. "
+                       "Teams are grouped by conference and ordered by imported overall "
+                       "win percentage; this is NOT an official conference rank.")
         conference_images = current_conference_logos()
         if not conference_images:
             st.caption("Conference logos are temporarily unavailable from ESPN; showing names instead.")
+        teams = sort_conference_teams(teams, positions, records)
         rows = []
         for _, team in teams.iterrows():
+            official = team['official_rank']
             rows.append([
-                team_badge(team["name"], team["team_id"], team["logo_url"], ap_ranks),
+                safe_cell(int(official)) if pd.notna(official) else '—',
+                team_badge(team["name"], team["team_id"], team["logo_url"],
+                           ap_ranks, records),
                 conference_badge(team["Conference"], conference_images),
                 safe_cell(rank_label(team["team_id"], efficiency_ranks)),
             ])
-        show_visual_table(["Team", "Conference", "Eff. rank"], rows)
+        show_visual_table(["Conf. rank", "Team", "Conference", "Eff. rank"], rows)
 
 elif page == "Team efficiency":
     st.subheader("Team efficiency rankings")
@@ -663,36 +846,65 @@ elif page == "Team explorer":
     else:
         team_name = st.selectbox("Choose a team", teams["name"].tolist())
         selected_team = teams.loc[teams["name"] == team_name].iloc[0]
-        team_id = selected_team["team_id"]
+        team_id = str(selected_team["team_id"])
+        records = season_records(season)
         try:
             efficiency_ranks, ap_ranks, _ = rank_maps(season, latest_season)
         except Exception:
             efficiency_ranks, ap_ranks = {}, {}
-        logo_col, details_col = st.columns([1, 5])
-        with logo_col:
-            if logo_url(selected_team["logo_url"]):
-                st.image(selected_team["logo_url"], width=85)
-        with details_col:
-            st.markdown(f"**Conference:** {selected_team['conference'] if pd.notna(selected_team['conference']) else '—'}")
-            st.caption(f"Current AP rank: {rank_label(team_id, ap_ranks)} · "
-                       f"Season efficiency rank: {rank_label(team_id, efficiency_ranks)}")
+        conference_name = (selected_team["conference"]
+                           if pd.notna(selected_team["conference"]) else "—")
+        st.markdown(
+            '<div class="mbb-team-card">' +
+            team_badge(selected_team["name"], team_id, selected_team["logo_url"],
+                       ap_ranks, records) + '</div>', unsafe_allow_html=True)
+        st.caption(f"Conference: {conference_name} · "
+                   f"Season efficiency rank: {rank_label(team_id, efficiency_ranks)} · "
+                   "Records are based on imported final scores.")
         games = query("""
-            SELECT g.game_date, CASE WHEN g.home_team_id=%s THEN a.name ELSE h.name END AS opponent,
-                   s.points,s.offensive_efficiency,s.defensive_efficiency,s.net_efficiency
-            FROM team_game_stats s JOIN games g ON g.game_id=s.game_id
-            JOIN teams h ON h.team_id=g.home_team_id JOIN teams a ON a.team_id=g.away_team_id
-            WHERE s.team_id=%s AND g.season=%s AND g.completed=1
-            ORDER BY g.game_date,g.game_id
-        """, (team_id,team_id,season))
+            SELECT g.game_id, g.game_date, g.home_team_id, g.away_team_id,
+                   g.home_score, g.away_score,
+                   CASE WHEN g.home_team_id=%s THEN a.team_id ELSE h.team_id END AS opponent_id,
+                   CASE WHEN g.home_team_id=%s THEN a.name ELSE h.name END AS opponent,
+                   CASE WHEN g.home_team_id=%s THEN a.logo_url ELSE h.logo_url END AS opponent_logo,
+                   s.offensive_efficiency,s.defensive_efficiency,s.net_efficiency
+            FROM games g
+            JOIN teams h ON h.team_id=g.home_team_id
+            JOIN teams a ON a.team_id=g.away_team_id
+            LEFT JOIN team_game_stats s ON s.game_id=g.game_id AND s.team_id=%s
+            WHERE (g.home_team_id=%s OR g.away_team_id=%s)
+              AND g.season=%s AND g.completed=1
+              AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+            ORDER BY g.game_date DESC, g.game_id DESC
+        """, (team_id, team_id, team_id, team_id, team_id, team_id, season))
         if games.empty:
-            st.info("No complete game box scores for this team yet.")
+            st.info("No completed games with final scores for this team yet.")
         else:
-            show_table(games.rename(columns={"game_date":"Date","opponent":"Opponent",
-                "points":"Points","offensive_efficiency":"Off / 100",
-                "defensive_efficiency":"Def / 100","net_efficiency":"Net / 100"}))
-            graph = games.set_index("game_date")[["offensive_efficiency","defensive_efficiency"]]
-            graph.columns = ["Offensive efficiency", "Defensive efficiency"]
-            st.line_chart(graph)
+            st.caption("Past games: Result is shown from the selected team's viewpoint "
+                       "(W/L, team score–opponent score). Opponent W–L is their current "
+                       "overall record from imported games, not their record at tipoff.")
+            rows = []
+            for _, game in games.iterrows():
+                rows.append([
+                    safe_cell(game['game_date']),
+                    team_badge(game['opponent'], game['opponent_id'],
+                               game['opponent_logo'], ap_ranks, records),
+                    matchup_result(game, team_id),
+                    safe_cell(round(game['offensive_efficiency'], 1))
+                        if pd.notna(game['offensive_efficiency']) else '—',
+                    safe_cell(round(game['defensive_efficiency'], 1))
+                        if pd.notna(game['defensive_efficiency']) else '—',
+                    safe_cell(round(game['net_efficiency'], 1))
+                        if pd.notna(game['net_efficiency']) else '—',
+                ])
+            show_visual_table(["Date", "Opponent", "Result", "Off / 100",
+                               "Def / 100", "Net / 100"], rows)
+            graph = (games.sort_values('game_date')
+                     .set_index('game_date')[['offensive_efficiency',
+                                              'defensive_efficiency']].dropna(how='all'))
+            if not graph.empty:
+                graph.columns = ['Offensive efficiency', 'Defensive efficiency']
+                st.line_chart(graph)
 
 elif page == "Player season averages":
     st.subheader("Player season averages")
