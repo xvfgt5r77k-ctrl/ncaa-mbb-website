@@ -1,0 +1,54 @@
+name: NCAA MBB Nightly ESPN Update
+
+on:
+  schedule:
+    # Every night at 3:37 AM Central, adjusted for daylight saving time.
+    - cron: '37 3 * * *'
+      timezone: 'America/Chicago'
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Optional YYYY-MM-DD start for a one-time historical backfill'
+        required: false
+        type: string
+      end_date:
+        description: 'Optional YYYY-MM-DD end for a one-time historical backfill'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ncaa-mbb-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out application
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run cloud ESPN import
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        run: |
+          if [ -n "$START_DATE" ]; then
+            if [ -n "$END_DATE" ]; then
+              python cloud_sync.py --start-date "$START_DATE" --end-date "$END_DATE"
+            else
+              python cloud_sync.py --start-date "$START_DATE"
+            fi
+          else
+            python cloud_sync.py --days-back 4 --days-forward 14
+          fi
