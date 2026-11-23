@@ -166,23 +166,84 @@ def rank_label(team_id, ranks: dict[str, int]) -> str:
     return f"#{value}" if value is not None else "—"
 
 
+def ranked_team_name(name, team_id, ap_ranks: dict[str, int]) -> str:
+    """Place the current AP poll rank inside the team-name column."""
+    position = ap_ranks.get(str(team_id))
+    return f"#{position} {name}" if position is not None else str(name)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def current_conference_logos() -> dict[str, str]:
+    """Map ESPN conference names to their published logos; never guess artwork URLs.
+
+    Conference display names were imported from this same ESPN endpoint, so
+    a normalized name match avoids changes to Supabase or the nightly importer.
+    """
+    endpoint = ("https://site.api.espn.com/apis/site/v2/sports/"
+                "basketball/mens-college-basketball/scoreboard/conferences")
+    try:
+        response = requests.get(endpoint, params={"seasontype": 2}, timeout=12,
+                                headers={"Accept": "application/json",
+                                         "User-Agent": "NCAA-MBB-Dashboard/1.0"})
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {}
+        output = {}
+        for conference in payload.get("conferences") or []:
+            if not isinstance(conference, dict):
+                continue
+            # ESPN's conference listing publishes 'logo' (a direct URL).
+            raw_logo = conference.get("logo")
+            if isinstance(raw_logo, dict):
+                raw_logo = raw_logo.get("href") or raw_logo.get("url")
+            if not raw_logo and isinstance(conference.get("logos"), list):
+                first = next((item for item in conference["logos"]
+                              if isinstance(item, dict) and
+                              (item.get("href") or item.get("url"))), None)
+                raw_logo = (first.get("href") or first.get("url")) if first else None
+            url = logo_url(raw_logo)
+            if not url:
+                continue
+            for name_key in ("name", "shortName", "abbreviation"):
+                name = conference.get(name_key)
+                if name and str(name).strip():
+                    output[str(name).strip().casefold()] = url
+        return output
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        # If ESPN is unavailable, show readable conference names instead.
+        return {}
+
+
+def conference_logo(name, conference_logos: dict[str, str]) -> str:
+    if not isinstance(name, str) or not name.strip():
+        return ""
+    return conference_logos.get(name.strip().casefold(), "")
+
+
 def schedule_display(games: pd.DataFrame, efficiency_ranks: dict[str, int],
-                     ap_ranks: dict[str, int]) -> pd.DataFrame:
-    """One game per row with logos, conferences and clearly labeled rankings."""
-    columns = ["Time (CT)", "Away logo", "Away", "Away conf.", "Away AP",
-               "Away Eff.", "Home logo", "Home", "Home conf.", "Home AP",
-               "Home Eff.", "Score (Away–Home)", "Status", "Venue"]
+                     ap_ranks: dict[str, int],
+                     conference_logos: dict[str, str] | None = None) -> pd.DataFrame:
+    """A compact game table: AP ranks inline; logos in conference columns."""
+    cols = ["Time (CT)", "Away logo", "Away", "Away conf.", "Away Eff.",
+            "Home logo", "Home", "Home conf.", "Home Eff.",
+            "Score (Away–Home)", "Status", "Venue"]
     if games.empty:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=cols)
     output = pd.DataFrame(index=games.index)
     output["Time (CT)"] = games["start_time_utc"].map(central_tipoff)
     for side in ("away", "home"):
         prefix = side.capitalize()
         output[prefix + " logo"] = games[side + "_logo"].map(logo_url)
-        output[prefix] = games[side]
-        output[prefix + " conf."] = games[side + "_conference"].fillna("—").replace("", "—")
-        output[prefix + " AP"] = games[side + "_id"].map(lambda ident: rank_label(ident, ap_ranks))
-        output[prefix + " Eff."] = games[side + "_id"].map(lambda ident: rank_label(ident, efficiency_ranks))
+        output[prefix] = [ranked_team_name(name, ident, ap_ranks)
+                          for name, ident in zip(games[side], games[side + "_id"])]
+        names = games[side + "_conference"].fillna("—").replace("", "—")
+        if conference_logos:
+            output[prefix + " conf."] = names.map(lambda n: conference_logo(n, conference_logos))
+        else:
+            output[prefix + " conf."] = names
+        output[prefix + " Eff."] = games[side + "_id"].map(
+            lambda ident: rank_label(ident, efficiency_ranks))
 
     def score(row):
         if row["status"] in ("STATUS_SCHEDULED", "STATUS_POSTPONED", "STATUS_CANCELED"):
@@ -195,17 +256,23 @@ def schedule_display(games: pd.DataFrame, efficiency_ranks: dict[str, int],
     output["Status"] = games["status_detail"].fillna("")
     output.loc[output["Status"].eq(""), "Status"] = games["status"].fillna("TBD")
     output["Venue"] = games["venue"].fillna("—")
-    return output[columns]
+    return output[cols]
 
 
 def show_schedule(games: pd.DataFrame, efficiency_ranks: dict[str, int],
-                  ap_ranks: dict[str, int]):
-    display = schedule_display(games, efficiency_ranks, ap_ranks)
-    st.dataframe(display, use_container_width=True, hide_index=True,
-                 column_config={
-                     "Away logo": st.column_config.ImageColumn("Away logo", width="small"),
-                     "Home logo": st.column_config.ImageColumn("Home logo", width="small"),
-                 })
+                  ap_ranks: dict[str, int],
+                  conference_logos: dict[str, str] | None = None):
+    display = schedule_display(games, efficiency_ranks, ap_ranks, conference_logos)
+    images = {
+        "Away logo": st.column_config.ImageColumn("Away logo", width="small"),
+        "Home logo": st.column_config.ImageColumn("Home logo", width="small"),
+    }
+    if conference_logos:
+        images["Away conf."] = st.column_config.ImageColumn("Away conf.", width="small",
+                                                               help="Conference logo from ESPN")
+        images["Home conf."] = st.column_config.ImageColumn("Home conf.", width="small",
+                                                               help="Conference logo from ESPN")
+    st.dataframe(display, use_container_width=True, hide_index=True, column_config=images)
 
 
 def load_schedule(season: int, start_date: str, end_date: str) -> pd.DataFrame:
@@ -267,9 +334,11 @@ if page == "Game schedules":
     except Exception:
         efficiency_ranks, ap_ranks = {}, {}
         st.warning("Efficiency ranks could not be loaded; schedules are still available.")
-    st.caption("AP = ESPN's current AP Top 25 poll (not the historical game-day rank); "
-               "Eff. = this database's unadjusted season net-efficiency rank. "
-               "A dash means unranked or not available.")
+    st.caption("AP ranking appears beside each team name (latest ESPN AP Top 25, not the historical "
+               "game-day rank). Eff. is this database's unadjusted net-efficiency rank.")
+    conference_images = current_conference_logos()
+    if not conference_images:
+        st.caption("Conference artwork is temporarily unavailable from ESPN; showing names instead.")
     if season == latest_season and not ap_ranks:
         st.caption("Current AP poll rankings are temporarily unavailable from ESPN.")
     st.caption("Times shown in America/Chicago. ESPN data is saved by your GitHub importer, not streamed live. "
@@ -287,7 +356,7 @@ if page == "Game schedules":
                     "use GitHub Actions → Run workflow with both date fields blank to load recent "
                     "results and the next 14 days of schedules.")
         else:
-            show_schedule(today_games, efficiency_ranks, ap_ranks)
+            show_schedule(today_games, efficiency_ranks, ap_ranks, conference_images)
 
     with upcoming_tab:
         window = st.selectbox("Look ahead", [7, 14, 30], index=1,
@@ -306,7 +375,7 @@ if page == "Game schedules":
             for date_value, day_games in upcoming.groupby("game_date", sort=True):
                 date_label = datetime.strptime(date_value, "%Y-%m-%d").strftime("%A, %B %d")
                 st.markdown(f"**{date_label} · {len(day_games)} games**")
-                show_schedule(day_games, efficiency_ranks, ap_ranks)
+                show_schedule(day_games, efficiency_ranks, ap_ranks, conference_images)
 
     with browse_tab:
         dates = query("SELECT DISTINCT game_date FROM games WHERE season=%s "
@@ -317,7 +386,7 @@ if page == "Game schedules":
             date_string = st.selectbox("Choose a date (Central Time)", dates["game_date"].tolist())
             games_on_date = load_schedule(season, date_string, date_string)
             st.caption(f"{len(games_on_date)} games")
-            show_schedule(games_on_date, efficiency_ranks, ap_ranks)
+            show_schedule(games_on_date, efficiency_ranks, ap_ranks, conference_images)
 
 elif page == "Teams & conferences":
     st.subheader("Division I teams & conferences")
@@ -342,22 +411,30 @@ elif page == "Teams & conferences":
             teams = teams[teams["name"].str.contains(search, case=False, regex=False, na=False)]
         if conference != "All conferences":
             teams = teams[teams["Conference"] == conference]
-        st.caption(f"{len(teams)} Division I teams shown · AP is the latest poll · "
-                   "Eff. is the database's season net-efficiency ranking")
+        st.caption(f"{len(teams)} Division I teams shown · AP ranks appear beside team names · "
+                   "Eff. = season net-efficiency ranking")
+        conference_images = current_conference_logos()
+        if not conference_images:
+            st.caption("Conference logos are temporarily unavailable from ESPN; showing names instead.")
         display = pd.DataFrame({
             "Logo": teams["logo_url"].map(logo_url),
-            "Team": teams["name"],
-            "Conference": teams["Conference"],
-            "AP rank": teams["team_id"].map(lambda t: rank_label(t, ap_ranks)),
+            "Team": [ranked_team_name(name, ident, ap_ranks)
+                     for name, ident in zip(teams["name"], teams["team_id"])],
+            "Conference": (teams["Conference"].map(lambda n: conference_logo(n, conference_images))
+                           if conference_images else teams["Conference"]),
             "Eff. rank": teams["team_id"].map(lambda t: rank_label(t, efficiency_ranks)),
         })
+        images = {"Logo": st.column_config.ImageColumn("Logo", width="small")}
+        if conference_images:
+            images["Conference"] = st.column_config.ImageColumn("Conference", width="small",
+                                                                 help="Conference logo from ESPN")
         st.dataframe(display, hide_index=True, use_container_width=True,
-                     column_config={"Logo": st.column_config.ImageColumn("Logo", width="small")})
+                     column_config=images)
 
 elif page == "Team efficiency":
     st.subheader("Team efficiency rankings")
-    st.caption("Eff. rank = unadjusted net efficiency from imported games, not an AP ranking. "
-               "AP rank is ESPN's latest Top 25 poll, when available.")
+    st.caption("Eff. rank = unadjusted net efficiency from imported games. "
+               "Latest ESPN AP Top 25 rank appears beside each team name, when available.")
     try:
         efficiency_ranks, ap_ranks, ranks = rank_maps(season, latest_season)
     except Exception:
@@ -367,18 +444,31 @@ elif page == "Team efficiency":
         st.info("No complete box scores imported for this season. Try running a historical backfill.")
     else:
         ranks.insert(0, "Eff. Rank", range(1, len(ranks)+1))
-        ranks.insert(1, "AP Rank", ranks["team_id"].map(lambda t: rank_label(t, ap_ranks)))
-        ranks.insert(2, "Logo", ranks["logo_url"].map(logo_url))
+        ranks.insert(1, "Logo", ranks["logo_url"].map(logo_url))
         renames = {"name":"Team", "conference":"Conference", "games":"GP",
                    "wins":"W", "losses":"L", "off_eff":"Off / 100", "def_eff":"Def / 100",
                    "net_eff":"Net / 100", "efg_pct":"eFG %", "tov_pct":"TO %"}
         display = ranks.rename(columns=renames)
-        display["Conference"] = display["Conference"].fillna("—").replace("", "—")
-        cols = ["Eff. Rank", "AP Rank", "Logo", "Team", "Conference", "GP", "W", "L",
+        display["Team"] = [ranked_team_name(name, ident, ap_ranks)
+                           for name, ident in zip(ranks["name"], ranks["team_id"])]
+        conference_names = display["Conference"].fillna("—").replace("", "—")
+        conference_images = current_conference_logos()
+        display["Conference"] = (conference_names.map(lambda n: conference_logo(n, conference_images))
+                                 if conference_images else conference_names)
+        if not conference_images:
+            st.caption("Conference logos are temporarily unavailable from ESPN; showing names instead.")
+        cols = ["Eff. Rank", "Logo", "Team", "Conference", "GP", "W", "L",
                 "Off / 100", "Def / 100", "Net / 100", "eFG %", "TO %"]
+        images = {"Logo": st.column_config.ImageColumn("Logo", width="small")}
+        if conference_images:
+            images["Conference"] = st.column_config.ImageColumn("Conference", width="small",
+                                                                 help="Conference logo from ESPN")
         st.dataframe(display[cols], use_container_width=True, hide_index=True,
-                     column_config={"Logo": st.column_config.ImageColumn("Logo", width="small")})
-        st.download_button("Download rankings (CSV)", display[cols].to_csv(index=False),
+                     column_config=images)
+        # Keep conference names (not image URLs) in the downloadable CSV.
+        csv_display = display[cols].copy()
+        csv_display["Conference"] = conference_names
+        st.download_button("Download rankings (CSV)", csv_display.to_csv(index=False),
                            "rankings.csv", "text/csv")
 
 elif page == "Team explorer":
