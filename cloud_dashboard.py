@@ -690,11 +690,11 @@ def select_next_five_games(games: pd.DataFrame, now_utc: datetime) -> pd.DataFra
 
 
 st.title("🏀 NCAA Men's Basketball Database")
-st.caption("Division I • ESPN game statistics • unadjusted, possession-based efficiency • Central Time")
+st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -900,6 +900,67 @@ elif page == "Team efficiency":
         st.download_button("Download rankings (CSV)", csv_display.to_csv(index=False),
                            "rankings.csv", "text/csv")
 
+elif page == "Adjusted SOS":
+    st.subheader("Opponent-adjusted strength of schedule")
+    st.caption("Calculated from completed ESPN team box scores. Opp. SOS is the average "
+               "opponent-adjusted NET efficiency of teams actually faced. Higher values "
+               "mean a tougher schedule; it is not an official NCAA ranking. Adjusted "
+               "offense/defense and SOS are measured in points per 100 possessions. "
+               "Small-sample ratings are shrunk toward the season average.")
+    available = query("SELECT to_regclass('public.team_adjusted_ratings') "
+                      "IS NOT NULL AS available")
+    if available.empty or not bool(available.iloc[0]["available"]):
+        st.info("The analytics tables haven't been created yet. In GitHub Actions, "
+                "run 'Update NCAA MBB Adjusted SOS and History' once.")
+    else:
+        sos = query("""
+            SELECT r.team_id, t.name AS team, COALESCE(t.conference,'—') AS conference,
+                   r.games_played AS gp,
+                   ROUND(r.adjusted_offense::numeric,1)::double precision AS adj_off,
+                   ROUND(r.adjusted_defense::numeric,1)::double precision AS adj_def,
+                   ROUND(r.adjusted_net::numeric,1)::double precision AS adj_net,
+                   ROUND(r.raw_net::numeric,1)::double precision AS raw_net,
+                   ROUND(r.opponent_sos::numeric,1)::double precision AS opp_sos
+            FROM team_adjusted_ratings r
+            JOIN teams t ON t.team_id = r.team_id
+            WHERE r.season=%s AND t.is_d1=1
+            ORDER BY r.opponent_sos DESC, t.name ASC
+        """, (season,))
+        if sos.empty:
+            st.info("No completed games with two full team box scores in this season yet. "
+                    "Run a historical ESPN import and refresh the analytics workflow.")
+        else:
+            c1, c2, c3 = st.columns([2, 2, 1])
+            with c1:
+                name_filter = st.text_input("Search team", key="sos_team")
+            with c2:
+                conference_filter = st.selectbox("Conference",
+                    ["All conferences"] + sorted(sos["conference"].unique().tolist()),
+                    key="sos_conference")
+            with c3:
+                min_games = st.number_input("Minimum games", min_value=1, value=1,
+                                            max_value=max(1, int(sos["gp"].max())),
+                                            key="sos_min_gp")
+            if name_filter:
+                sos = sos[sos["team"].str.contains(name_filter, case=False,
+                                                   na=False, regex=False)]
+            if conference_filter != "All conferences":
+                sos = sos[sos["conference"] == conference_filter]
+            sos = sos[sos["gp"] >= min_games]
+            sos = sos.reset_index(drop=True)
+            sos.insert(0, "SOS rank", sos.index + 1)
+            display = sos.rename(columns={"team":"Team", "conference":"Conference",
+                "gp":"GP", "adj_off":"Adj Off / 100", "adj_def":"Adj Def / 100",
+                "adj_net":"Adj Net / 100", "raw_net":"Raw Net / 100",
+                "opp_sos":"Opponent SOS"}).drop(columns=["team_id"])
+            st.caption("SOS rank is the current order of displayed results, not an "
+                       "official conference or national ranking. Unimported opponents "
+                       "and missing box scores can bias these figures.")
+            show_table(display)
+            st.download_button("Download adjusted ratings (CSV)",
+                               display.to_csv(index=False),
+                               f"adjusted_sos_{season}.csv", "text/csv")
+
 elif page == "Team explorer":
     st.subheader("Team explorer")
     teams = query("SELECT team_id,name,conference,logo_url FROM teams WHERE is_d1=1 ORDER BY name")
@@ -923,6 +984,20 @@ elif page == "Team explorer":
         st.caption(f"Conference: {conference_name} · "
                    f"Season efficiency rank: {rank_label(team_id, efficiency_ranks)} · "
                    "Records are based on imported final scores.")
+        # Read-only opponent adjustment; separate analytics workflow owns this table.
+        if query("SELECT to_regclass('public.team_adjusted_ratings') "
+                 "IS NOT NULL AS available").iloc[0]["available"]:
+            current_sos = query("""
+                SELECT games_played, adjusted_net, opponent_sos
+                FROM team_adjusted_ratings WHERE season=%s AND team_id=%s
+            """, (season, team_id))
+            if not current_sos.empty:
+                ar = current_sos.iloc[0]
+                st.caption("Opponent-adjusted net efficiency: "
+                           f"{ar['adjusted_net']:+.1f} per 100 possessions · "
+                           f"Opponent SOS: {ar['opponent_sos']:+.1f} · "
+                           f"Based on {int(ar['games_played'])} complete box scores. "
+                           "See Adjusted SOS for methodology.")
         st.markdown("#### Team season averages")
         team_averages = query(TEAM_SEASON_AVERAGES_QUERY, (team_id, season))
         if team_averages.empty or int(team_averages.iloc[0]["gp"]) == 0:
@@ -1030,6 +1105,70 @@ elif page == "Team explorer":
             if not graph.empty:
                 graph.columns = ['Offensive efficiency', 'Defensive efficiency']
                 st.line_chart(graph)
+
+elif page == "Historical team trends":
+    st.subheader("Historical team efficiency & schedule trends")
+    st.caption("Date-by-date records of each team's opponent-adjusted efficiency "
+               "and strength of schedule, updated after games on the displayed "
+               "date. These are descriptive historical snapshots; they are not "
+               "game forecasts or an automated prediction/backtesting model.")
+    available = query("SELECT to_regclass('public.historical_team_snapshots') "
+                      "IS NOT NULL AS available")
+    if available.empty or not bool(available.iloc[0]["available"]):
+        st.info("The historical trend table hasn't been created yet. In GitHub "
+                "Actions, run 'Update NCAA MBB Adjusted SOS and History' once.")
+    else:
+        team_choices = query("""
+            SELECT DISTINCT t.team_id, t.name
+            FROM historical_team_snapshots s
+            JOIN teams t ON t.team_id=s.team_id
+            WHERE s.season=%s AND t.is_d1=1
+            ORDER BY t.name
+        """, (season,))
+        if team_choices.empty:
+            st.info("No historical snapshots have been calculated for this "
+                    "season. Import historical completed games, then refresh the "
+                    "analytics workflow.")
+        else:
+            chosen = st.selectbox("Select a team", team_choices["name"].tolist(),
+                                  key="historical_trend_team")
+            chosen_id = str(team_choices.loc[
+                team_choices["name"] == chosen, "team_id"].iloc[0])
+            snapshots = query("""
+                SELECT snapshot_date, games_played,
+                       ROUND(adjusted_offense::numeric,1)::double precision AS adj_off,
+                       ROUND(adjusted_defense::numeric,1)::double precision AS adj_def,
+                       ROUND(adjusted_net::numeric,1)::double precision AS adj_net,
+                       ROUND(opponent_sos::numeric,1)::double precision AS opponent_sos
+                FROM historical_team_snapshots
+                WHERE season=%s AND team_id=%s
+                ORDER BY snapshot_date
+            """, (season,chosen_id))
+            if not snapshots.empty:
+                current = snapshots.iloc[-1]
+                col1,col2,col3 = st.columns(3)
+                col1.metric("Imported games", f"{int(current['games_played'])}")
+                col2.metric("Latest adjusted net / 100",
+                            f"{current['adj_net']:+.1f}")
+                col3.metric("Latest opponent SOS",
+                            f"{current['opponent_sos']:+.1f}")
+                graph = snapshots.set_index('snapshot_date')[
+                    ['adj_net', 'opponent_sos']].rename(columns={
+                        'adj_net': 'Adjusted net / 100',
+                        'opponent_sos': 'Opponent SOS / 100'})
+                st.line_chart(graph)
+                display = snapshots.rename(columns={
+                    'snapshot_date':'Date', 'games_played':'GP',
+                    'adj_off':'Adjusted offense', 'adj_def':'Adjusted defense',
+                    'adj_net':'Adjusted net', 'opponent_sos':'Opponent SOS'})
+                show_table(display)
+                st.download_button("Download team trend history (CSV)",
+                                   display.to_csv(index=False),
+                                   f"historical_sos_{season}_{chosen_id}.csv",
+                                   "text/csv")
+                st.caption("Only dates on which this team has imported complete "
+                           "box scores appear. If historical games haven't been "
+                           "backfilled, the trend will be incomplete.")
 
 elif page == "Player season averages":
     st.subheader("Player season averages")
@@ -1222,7 +1361,8 @@ else:
                 st.code(latest["errors"])
 
 st.divider()
-st.caption("Off/100 and Def/100 are based on estimated possessions and are not opponent-adjusted. "
+st.caption("Raw Off/100 and Def/100 on existing game tables are unadjusted; "
+           "the new Adjusted SOS page is opponent-adjusted and includes small-sample shrinkage. "
            "AP poll is fetched from ESPN when available; team logos and conferences come from imported ESPN data. "
            "ESPN endpoints are unofficial and may change; nightly updates and AP poll availability are not guaranteed. "
            "Official conference availability reports are separately verified and game-specific.")
