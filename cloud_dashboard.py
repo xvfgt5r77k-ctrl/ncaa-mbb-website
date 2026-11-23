@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import logging
+from html import escape
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -221,47 +222,90 @@ def conference_logo(name, conference_logos: dict[str, str]) -> str:
     return conference_logos.get(name.strip().casefold(), "")
 
 
-def schedule_display(games: pd.DataFrame, efficiency_ranks: dict[str, int],
-                     ap_ranks: dict[str, int],
-                     conference_logos: dict[str, str] | None = None) -> pd.DataFrame:
-    """A compact game table: AP ranks inline; logos in conference columns."""
-    cols = ["Time (CT)", "Away logo", "Away", "Away conf.", "Away Eff.",
-            "Home logo", "Home", "Home conf.", "Home Eff.", "Venue"]
-    if games.empty:
-        return pd.DataFrame(columns=cols)
-    output = pd.DataFrame(index=games.index)
-    output["Time (CT)"] = games["start_time_utc"].map(central_tipoff)
-    for side in ("away", "home"):
-        prefix = side.capitalize()
-        output[prefix + " logo"] = games[side + "_logo"].map(logo_url)
-        output[prefix] = [ranked_team_name(name, ident, ap_ranks)
-                          for name, ident in zip(games[side], games[side + "_id"])]
-        names = games[side + "_conference"].fillna("—").replace("", "—")
-        if conference_logos:
-            output[prefix + " conf."] = names.map(lambda n: conference_logo(n, conference_logos))
-        else:
-            output[prefix + " conf."] = names
-        output[prefix + " Eff."] = games[side + "_id"].map(
-            lambda ident: rank_label(ident, efficiency_ranks))
+def safe_cell(value) -> str:
+    """Escape database values before they are added to the presentation HTML."""
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return "—"
+    return escape(str(value))
 
-    output["Venue"] = games["venue"].fillna("—")
-    return output[cols]
+
+def team_badge(name, team_id, image_url, ap_ranks: dict[str, int]) -> str:
+    """A single team cell in the order AP rank → team logo → team name."""
+    position = ap_ranks.get(str(team_id))
+    ap = (f'<span class="mbb-ap">#{int(position)}</span>' if position is not None
+          else '<span class="mbb-ap" aria-label="Unranked"></span>')
+    url = logo_url(image_url)
+    picture = (f'<img class="mbb-team-logo" src="{escape(url, quote=True)}" '
+               'width="26" height="26" loading="lazy" alt="">' if url
+               else '<span class="mbb-logo-placeholder" aria-hidden="true"></span>')
+    return (f'<span class="mbb-team">{ap}{picture}'
+            f'<span class="mbb-team-name">{safe_cell(name)}</span></span>')
+
+
+def conference_badge(name, conference_logos: dict[str, str]) -> str:
+    """Show ESPN conference artwork when possible, otherwise show readable text."""
+    url = conference_logo(name, conference_logos)
+    if not url:
+        return safe_cell(name)
+    safe_name = safe_cell(name)
+    return (f'<img class="mbb-conference-logo" src="{escape(url, quote=True)}" '
+            f'alt="{safe_name} conference" title="{safe_name}" '
+            'width="32" height="28" loading="lazy">')
+
+
+def show_visual_table(headers: list[str], rows: list[list[str]]) -> None:
+    """HTML table allows a logo and AP rank in the SAME team-name column.
+
+    Streamlit's standard dataframe does not support inline images and text in
+    one cell. All plain text is escaped, while image URLs are HTTPS-validated.
+    """
+    css = """
+    <style>
+      .mbb-table-scroll {width:100%; overflow-x:auto; border:1px solid rgba(128,128,128,.25);
+                         border-radius:9px; margin:.5rem 0 1.1rem;}
+      table.mbb-table {border-collapse:collapse; width:100%; min-width:790px; font-size:.88rem;}
+      .mbb-table th {padding:10px 12px; text-align:left; white-space:nowrap;
+                     background:rgba(128,128,128,.09); font-weight:650;
+                     border-bottom:1px solid rgba(128,128,128,.25);}
+      .mbb-table td {padding:9px 12px; white-space:nowrap; vertical-align:middle;
+                     border-bottom:1px solid rgba(128,128,128,.15);}
+      .mbb-table tr:last-child td {border-bottom:0;}
+      .mbb-table tbody tr:hover {background:rgba(128,128,128,.08);}
+      .mbb-team {display:inline-flex; align-items:center; gap:7px; min-width:155px;}
+      .mbb-ap {display:inline-block; min-width:28px; font-weight:700; font-size:.84rem;}
+      .mbb-team-logo {width:26px; height:26px; object-fit:contain; flex:0 0 26px;}
+      .mbb-logo-placeholder {display:inline-block; width:26px; flex:0 0 26px;}
+      .mbb-team-name {font-weight:550;}
+      .mbb-conference-logo {height:28px; width:32px; object-fit:contain;}
+    </style>
+    """
+    header_html = "".join(f"<th scope=\"col\">{safe_cell(h)}</th>" for h in headers)
+    body_html = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+                        for row in rows)
+    html = (css + '<div class="mbb-table-scroll"><table class="mbb-table">'
+            f'<thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody>'
+            '</table></div>')
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def show_schedule(games: pd.DataFrame, efficiency_ranks: dict[str, int],
                   ap_ranks: dict[str, int],
                   conference_logos: dict[str, str] | None = None):
-    display = schedule_display(games, efficiency_ranks, ap_ranks, conference_logos)
-    images = {
-        "Away logo": st.column_config.ImageColumn("Away logo", width="small"),
-        "Home logo": st.column_config.ImageColumn("Home logo", width="small"),
-    }
-    if conference_logos:
-        images["Away conf."] = st.column_config.ImageColumn("Away conf.", width="small",
-                                                               help="Conference logo from ESPN")
-        images["Home conf."] = st.column_config.ImageColumn("Home conf.", width="small",
-                                                               help="Conference logo from ESPN")
-    st.dataframe(display, use_container_width=True, hide_index=True, column_config=images)
+    conference_logos = conference_logos or {}
+    rows = []
+    for _, game in games.iterrows():
+        rows.append([
+            safe_cell(central_tipoff(game["start_time_utc"])),
+            team_badge(game["away"], game["away_id"], game["away_logo"], ap_ranks),
+            conference_badge(game["away_conference"], conference_logos),
+            safe_cell(rank_label(game["away_id"], efficiency_ranks)),
+            team_badge(game["home"], game["home_id"], game["home_logo"], ap_ranks),
+            conference_badge(game["home_conference"], conference_logos),
+            safe_cell(rank_label(game["home_id"], efficiency_ranks)),
+            safe_cell(game["venue"]),
+        ])
+    show_visual_table(["Time (CT)", "Away team", "Away conf.", "Away Eff.",
+                       "Home team", "Home conf.", "Home Eff.", "Venue"], rows)
 
 
 def load_schedule(season: int, start_date: str, end_date: str) -> pd.DataFrame:
@@ -323,7 +367,7 @@ if page == "Game schedules":
     except Exception:
         efficiency_ranks, ap_ranks = {}, {}
         st.warning("Efficiency ranks could not be loaded; schedules are still available.")
-    st.caption("AP ranking appears beside each team name (latest ESPN AP Top 25, not the historical "
+    st.caption("Teams display AP rank → team logo → name (latest ESPN AP Top 25, not the historical "
                "game-day rank). Eff. is this database's unadjusted net-efficiency rank.")
     conference_images = current_conference_logos()
     if not conference_images:
@@ -400,30 +444,24 @@ elif page == "Teams & conferences":
             teams = teams[teams["name"].str.contains(search, case=False, regex=False, na=False)]
         if conference != "All conferences":
             teams = teams[teams["Conference"] == conference]
-        st.caption(f"{len(teams)} Division I teams shown · AP ranks appear beside team names · "
+        st.caption(f"{len(teams)} Division I teams shown · AP rank → team logo → name · "
                    "Eff. = season net-efficiency ranking")
         conference_images = current_conference_logos()
         if not conference_images:
             st.caption("Conference logos are temporarily unavailable from ESPN; showing names instead.")
-        display = pd.DataFrame({
-            "Logo": teams["logo_url"].map(logo_url),
-            "Team": [ranked_team_name(name, ident, ap_ranks)
-                     for name, ident in zip(teams["name"], teams["team_id"])],
-            "Conference": (teams["Conference"].map(lambda n: conference_logo(n, conference_images))
-                           if conference_images else teams["Conference"]),
-            "Eff. rank": teams["team_id"].map(lambda t: rank_label(t, efficiency_ranks)),
-        })
-        images = {"Logo": st.column_config.ImageColumn("Logo", width="small")}
-        if conference_images:
-            images["Conference"] = st.column_config.ImageColumn("Conference", width="small",
-                                                                 help="Conference logo from ESPN")
-        st.dataframe(display, hide_index=True, use_container_width=True,
-                     column_config=images)
+        rows = []
+        for _, team in teams.iterrows():
+            rows.append([
+                team_badge(team["name"], team["team_id"], team["logo_url"], ap_ranks),
+                conference_badge(team["Conference"], conference_images),
+                safe_cell(rank_label(team["team_id"], efficiency_ranks)),
+            ])
+        show_visual_table(["Team", "Conference", "Eff. rank"], rows)
 
 elif page == "Team efficiency":
     st.subheader("Team efficiency rankings")
     st.caption("Eff. rank = unadjusted net efficiency from imported games. "
-               "Latest ESPN AP Top 25 rank appears beside each team name, when available.")
+               "Team cells display AP rank → logo → name, when available.")
     try:
         efficiency_ranks, ap_ranks, ranks = rank_maps(season, latest_season)
     except Exception:
@@ -448,12 +486,23 @@ elif page == "Team efficiency":
             st.caption("Conference logos are temporarily unavailable from ESPN; showing names instead.")
         cols = ["Eff. Rank", "Logo", "Team", "Conference", "GP", "W", "L",
                 "Off / 100", "Def / 100", "Net / 100", "eFG %", "TO %"]
-        images = {"Logo": st.column_config.ImageColumn("Logo", width="small")}
-        if conference_images:
-            images["Conference"] = st.column_config.ImageColumn("Conference", width="small",
-                                                                 help="Conference logo from ESPN")
-        st.dataframe(display[cols], use_container_width=True, hide_index=True,
-                     column_config=images)
+        rows = []
+        for i, team in ranks.iterrows():
+            rows.append([
+                safe_cell(team["Eff. Rank"]),
+                team_badge(team["name"], team["team_id"], team["logo_url"], ap_ranks),
+                conference_badge(team["conference"], conference_images),
+                safe_cell(team["games"]),
+                safe_cell(team["wins"]),
+                safe_cell(team["losses"]),
+                safe_cell(team["off_eff"]),
+                safe_cell(team["def_eff"]),
+                safe_cell(team["net_eff"]),
+                safe_cell(team["efg_pct"]),
+                safe_cell(team["tov_pct"]),
+            ])
+        show_visual_table(["Eff. Rank", "Team", "Conference", "GP", "W", "L",
+                           "Off / 100", "Def / 100", "Net / 100", "eFG %", "TO %"], rows)
         # Keep conference names (not image URLs) in the downloadable CSV.
         csv_display = display[cols].copy()
         csv_display["Conference"] = conference_names
