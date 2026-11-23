@@ -870,12 +870,152 @@ def scoring_pattern_group_summary(frame: pd.DataFrame, by: str) -> pd.DataFrame:
     return groups.rename(columns={"games": "Team box scores", "ppg": "Scored PPG",
                                   "deviation": "Typical variation", "standard_deviation": "Score SD"}).round(2)
 
+
+
+# Retrospective feature associations: the values below are from completed games,
+# with feature columns supplied by the STRICTLY PRE-GAME dataset. No model is
+# trained and no results for upcoming games or betting decisions are generated.
+FEATURE_ASSOCIATIONS = {
+    "Prior adjusted net efficiency": ("prior_adj_net", "margin", "Actual scoring margin"),
+    "Prior strength of schedule": ("prior_sos", "margin", "Actual scoring margin"),
+    "Prior offensive efficiency": ("prior_offense", "points", "Actual team points"),
+    "Prior defensive efficiency": ("prior_defense", "opp_points", "Actual points allowed"),
+    "Prior raw net efficiency": ("prior_raw_net", "margin", "Actual scoring margin"),
+    "Prior pace (possessions/game)": ("prior_pace", "total_points", "Actual combined points"),
+    "Recent five scoring margin": ("recent_margin", "margin", "Actual scoring margin"),
+    "Rest days": ("rest_days", "margin", "Actual scoring margin"),
+    "Prior points per game": ("prior_ppg", "points", "Actual team points"),
+}
+
+FEATURE_ANALYSIS_SQL = """
+SELECT f.season, f.game_id, f.game_date, f.team_id, t.name AS team,
+       f.games_before, f.rating_snapshot_date,
+       f.adjusted_net_before AS prior_adj_net,
+       f.opponent_sos_before AS prior_sos,
+       f.raw_offense AS prior_offense,
+       f.raw_defense AS prior_defense,
+       f.raw_net AS prior_raw_net,
+       f.avg_points_for AS prior_ppg,
+       f.avg_possessions AS prior_pace,
+       f.recent_five_margin AS recent_margin,
+       f.rest_days,
+       CASE WHEN f.neutral_site=1 THEN 'Neutral'
+            WHEN f.is_home=1 THEN 'Home' ELSE 'Away' END AS venue,
+       s.points AS points, o.points AS opp_points
+FROM pregame_team_features f
+JOIN games g ON g.game_id=f.game_id AND g.season=f.season AND g.completed=1
+JOIN teams t ON t.team_id=f.team_id AND t.is_d1=1
+JOIN teams ot ON ot.team_id=f.opponent_id AND ot.is_d1=1
+JOIN team_game_stats s ON s.game_id=f.game_id AND s.team_id=f.team_id
+JOIN team_game_stats o ON o.game_id=f.game_id AND o.team_id=f.opponent_id
+WHERE f.season BETWEEN %s AND %s
+  AND s.points IS NOT NULL AND o.points IS NOT NULL
+  AND s.possessions > 0 AND o.possessions > 0
+  AND ((f.is_home=1 AND s.points=g.home_score AND o.points=g.away_score)
+    OR (f.is_home=0 AND s.points=g.away_score AND o.points=g.home_score))
+ORDER BY f.season,f.game_date,f.game_id,f.team_id
+"""
+
+
+def feature_analysis_prepare(raw: pd.DataFrame, min_history: int = 5) -> pd.DataFrame:
+    """Use only completed D1 matchups (guaranteed by SQL) with past-game history.
+
+    Any absent/non-prior adjusted snapshot is masked, NOT forward-filled.
+    The associated feature never uses data from the completed game itself.
+    """
+    if raw.empty:
+        return raw.copy()
+    data = raw.copy()
+    for col in ("games_before", "prior_adj_net", "prior_sos", "prior_offense",
+                "prior_defense", "prior_raw_net", "prior_ppg", "prior_pace",
+                "recent_margin", "rest_days", "points", "opp_points"):
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    data["game_date"] = pd.to_datetime(data["game_date"], errors="coerce")
+    ratings_date = pd.to_datetime(data["rating_snapshot_date"], errors="coerce")
+    has_prior_rating = ratings_date.notna() & data["game_date"].notna() & (ratings_date < data["game_date"])
+    data["invalid_prior_rating"] = ((data["prior_adj_net"].notna() | data["prior_sos"].notna())
+                                     & ~has_prior_rating)
+    data.loc[~has_prior_rating, ["prior_adj_net", "prior_sos"]] = float("nan")
+    data = data.dropna(subset=["game_date", "games_before", "points", "opp_points"])
+    data = data[(data["games_before"] >= min_history) &
+                (data["points"] >= 0) & (data["opp_points"] >= 0)].copy()
+    data["margin"] = data["points"] - data["opp_points"]
+    data["total_points"] = data["points"] + data["opp_points"]
+    data["rest_band"] = data["rest_days"].apply(
+        lambda x: "Unknown" if pd.isna(x) else
+        "0 days" if x == 0 else "1 day" if x == 1 else
+        "2 days" if x == 2 else "3+ days" if x >= 3 else "Unknown")
+    return data
+
+
+def feature_analysis_pairs(data: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Validated numeric pairs for one historical association."""
+    col, outcome, _ = FEATURE_ASSOCIATIONS[metric]
+    if data.empty:
+        return pd.DataFrame(columns=["season", "game_date", "team", "venue", col, outcome])
+    part = data[["season", "game_date", "team", "venue", col, outcome]].copy()
+    return part.dropna(subset=[col, outcome])
+
+
+def feature_analysis_correlations(data: pd.DataFrame, minimum: int = 30) -> pd.DataFrame:
+    """Descriptive pooled Pearson correlations; never causal or forecast accuracy."""
+    items = []
+    for metric, (col, target, title) in FEATURE_ASSOCIATIONS.items():
+        valid = feature_analysis_pairs(data, metric)
+        n = len(valid)
+        correlation = (float(valid[col].corr(valid[target]))
+                       if n >= minimum and valid[col].nunique() > 1
+                       and valid[target].nunique() > 1 else float("nan"))
+        items.append({"Statistic": metric, "Historical outcome": title,
+                      "Team-game rows": n, "Pearson r": correlation})
+    return pd.DataFrame(items)
+
+
+def feature_analysis_bands(pairs: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Quartile grouping of past-game features, with no extrapolation."""
+    col, target, _ = FEATURE_ASSOCIATIONS[metric]
+    if len(pairs) < 4 or pairs[col].nunique() < 2:
+        return pd.DataFrame(columns=["Prior-statistic range", "Team-game rows", "Mean outcome"])
+    series = pd.qcut(pairs[col], q=4, duplicates="drop")
+    grouped = pairs.assign(band=series).groupby("band", observed=True)[target].agg(["count", "mean"]).reset_index()
+    grouped["band"] = grouped["band"].astype(str)
+    return grouped.rename(columns={"band": "Prior-statistic range",
+                                   "count": "Team-game rows", "mean": "Mean outcome"}).round(2)
+
+
+def feature_analysis_venue_rest(data: pd.DataFrame, field: str) -> pd.DataFrame:
+    """Descriptive group counts and scored/allowed points, not causal effects."""
+    if data.empty:
+        return pd.DataFrame(columns=[field, "Team-game rows", "Avg scored", "Avg allowed", "Avg margin"])
+    g = data.groupby(field, dropna=False, observed=True).agg(
+        count=("points", "size"),
+        scored=("points", "mean"),
+        allowed=("opp_points", "mean"),
+        margin=("margin", "mean")
+    ).reset_index()
+    result = g.rename(columns={"count": "Team-game rows", "scored": "Avg scored",
+                               "allowed": "Avg allowed", "margin": "Avg margin"})
+    return result.round(2)
+
+
+def feature_analysis_coverage(data: pd.DataFrame) -> pd.DataFrame:
+    """Coverage is measured AFTER applying the configured minimum history filter."""
+    count = len(data)
+    rows = []
+    for name, (col, _, _) in FEATURE_ASSOCIATIONS.items():
+        n = int(data[col].notna().sum()) if count else 0
+        rows.append({"Statistic": name, "Rows available": n,
+                     "Rows reviewed": count,
+                     "Coverage %": round(100 * n / count, 1) if count else 0.0})
+    return pd.DataFrame(rows)
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
     page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer",
-                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Injuries", "Update status"], label_visibility="collapsed")
+                                    "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -1986,6 +2126,129 @@ elif page == "Historical Scoring Review":
     st.caption("This page uses existing historical tables, does not change Supabase "
                "records, and does not require a new workflow.")
 
+
+elif page == "Statistical Feature Analysis":
+    st.subheader("Statistical feature analysis")
+    st.caption("Retrospective relationships between stats known BEFORE each game and actual "
+               "completed-game performance. Correlations are descriptive, not causal, "
+               "and are not a measure of a trained model's accuracy.")
+    table_exists = query(
+        "SELECT to_regclass('public.pregame_team_features') IS NOT NULL AS exists"
+    )
+    if table_exists.empty or not bool(table_exists.iloc[0]["exists"]):
+        st.info("First run Verify NCAA MBB Historical Pregame Data in GitHub Actions.")
+    else:
+        scope = st.radio("Historical game range", ["Five completed seasons (2021–22 to 2025–26)",
+                                                  "Selected ESPN season"], horizontal=True,
+                         key="feature_analysis_scope")
+        start_season, end_season = ((2022, 2026)
+                                    if scope.startswith("Five completed") else (season, season))
+        min_games = st.slider("Minimum prior usable games per team", min_value=1,
+                              max_value=20, value=5, key="feature_min_prior_games")
+        historical = query(FEATURE_ANALYSIS_SQL, (start_season, end_season))
+        analysis = feature_analysis_prepare(historical, min_history=min_games)
+        if analysis.empty:
+            st.info("No eligible completed D1 games with enough prior history in this range. "
+                    "Try selecting the five historical seasons or reducing the prior-games minimum.")
+        else:
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Historical team-game rows", f"{len(analysis):,}")
+            col2.metric("Unique completed games", f"{analysis['game_id'].nunique():,}")
+            col3.metric("Seasons included", f"{analysis['season'].nunique()}")
+            col4.metric("Invalid/missing prior rating used", "0")
+            if analysis["invalid_prior_rating"].any():
+                st.warning(f"{int(analysis['invalid_prior_rating'].sum()):,} rows "
+                           "had adjusted ratings without a strictly earlier snapshot. "
+                           "Those values are EXCLUDED from adjusted-rating analysis.")
+            st.caption("Each team contributes one row per completed game; two teams from "
+                       "the same matchup are not independent observations. Only D1-vs-D1 "
+                       "matchups with consistent final scores and usable box scores are included.")
+
+            overview_tab, detail_tab, location_tab, coverage_tab = st.tabs([
+                "Correlation overview", "Metric explorer", "Venue and rest", "Feature coverage"
+            ])
+            with overview_tab:
+                st.markdown("#### Pregame statistics versus historical results")
+                correlations = feature_analysis_correlations(analysis)
+                display_correlations = correlations.copy()
+                display_correlations["Pearson r"] = display_correlations["Pearson r"].round(3)
+                show_table(display_correlations)
+                chart_correlations = correlations.dropna(subset=["Pearson r"])
+                if not chart_correlations.empty:
+                    st.bar_chart(chart_correlations.set_index("Statistic")[["Pearson r"]])
+                st.caption("Pearson r ranges from −1 to +1; its magnitude measures a "
+                           "linear association, not explanatory certainty or predictive "
+                           "accuracy. Metrics here have DIFFERENT historical outcomes "
+                           "(scoring, points allowed, margin, and combined points), so "
+                           "the bars should not be treated as a single feature ranking.")
+            with detail_tab:
+                st.markdown("#### Explore one pregame statistical relationship")
+                metric = st.selectbox("Pregame statistic", list(FEATURE_ASSOCIATIONS),
+                                      key="feature_analysis_metric")
+                source_col, target_col, target_name = FEATURE_ASSOCIATIONS[metric]
+                pairs = feature_analysis_pairs(analysis, metric)
+                if pairs.empty:
+                    st.info("This pregame statistic has no usable observations in the selected range.")
+                else:
+                    corr = (pairs[source_col].corr(pairs[target_col])
+                            if len(pairs) >= 30 and pairs[source_col].nunique() > 1
+                            and pairs[target_col].nunique() > 1 else float("nan"))
+                    c1, c2 = st.columns(2)
+                    c1.metric("Historical observations", f"{len(pairs):,}")
+                    c2.metric("Pearson r", f"{corr:+.3f}" if pd.notna(corr) else "Insufficient variation")
+                    st.caption("Scatter plot is deterministically sampled for readability; "
+                               "tables and correlations use all eligible rows.")
+                    stride = max(1, (len(pairs) + 1999) // 2000)
+                    plot = pairs.iloc[::stride].rename(columns={source_col: metric,
+                                                                 target_col: target_name})
+                    st.scatter_chart(plot, x=metric, y=target_name)
+                    st.markdown("##### Historical feature quartiles")
+                    bands = feature_analysis_bands(pairs, metric)
+                    if not bands.empty:
+                        show_table(bands)
+                    else:
+                        st.caption("Insufficient unique values for quartile comparisons.")
+                    st.markdown("##### Correlation by season")
+                    per_season = []
+                    for yr, subset in pairs.groupby("season"):
+                        val = (subset[source_col].corr(subset[target_col])
+                               if len(subset) >= 30 and subset[source_col].nunique() > 1
+                               and subset[target_col].nunique() > 1 else float("nan"))
+                        per_season.append({"Season": historical_season_label(int(yr)),
+                                           "Team-game rows": len(subset), "Pearson r": val})
+                    show_table(pd.DataFrame(per_season).round(3))
+            with location_tab:
+                st.markdown("#### Scoring by venue")
+                venue = feature_analysis_venue_rest(analysis, "venue")
+                show_table(venue)
+                if not venue.empty:
+                    st.bar_chart(venue.set_index("venue")[["Avg scored", "Avg allowed"]])
+                st.markdown("#### Scoring by days of rest")
+                rest = feature_analysis_venue_rest(analysis, "rest_band")
+                show_table(rest)
+                st.caption("Venue/rest differences are NOT adjusted for opponent strength, "
+                           "team composition, schedule timing, or selection effects, "
+                           "and must not be interpreted as causal home-court/rest effects.")
+            with coverage_tab:
+                st.markdown("#### Availability of each pregame metric")
+                coverage = feature_analysis_coverage(analysis)
+                show_table(coverage)
+                st.caption("Missing adjusted ratings are intentionally left blank, "
+                           "especially at the beginning of a season. No future or "
+                           "same-day ratings are filled in.")
+                st.download_button("Download feature coverage (CSV)",
+                                   data=coverage.to_csv(index=False),
+                                   file_name=f"ncaa_feature_coverage_{start_season}_{end_season}.csv",
+                                   mime="text/csv", key="feature_coverage_download")
+                st.download_button("Download eligible historical team-game rows (CSV)",
+                                   data=analysis.drop(columns=["invalid_prior_rating"])
+                                                .to_csv(index=False),
+                                   file_name=f"ncaa_feature_history_{start_season}_{end_season}.csv",
+                                   mime="text/csv", key="feature_history_download")
+    st.caption("Data source: your existing Supabase pregame_team_features and completed "
+               "ESPN games/box scores. This page reads data only. It does not modify "
+               "Supabase or produce upcoming-matchup forecasts, picks, or wagering outputs.")
+
 elif page == "Injuries":
     st.subheader("Official conference player availability")
     st.caption("Statuses come from manually verified official conference reports "
@@ -2060,6 +2323,67 @@ elif page == "Injuries":
 
 else:
     st.subheader("Cloud update status")
+    st.markdown("#### Automated database health")
+    has_health = query("SELECT to_regclass('public.data_health_runs') IS NOT NULL AS exists")
+    if has_health.empty or not bool(has_health.iloc[0]["exists"]):
+        st.info("No automated health checks yet. In GitHub Actions, run "
+                "'NCAA MBB Daily Data Health' once after uploading its workflow "
+                "and daily_data_health.py.")
+    else:
+        health = query("""
+            SELECT run_id, checked_at, season, window_start, window_end,
+                   status, last_import_status, last_import_finished_at,
+                   import_age_hours, recent_completed_d1_games, missing_scores,
+                   missing_box_scores, invalid_possessions, score_mismatches,
+                   missing_pregame_pairs, current_season_completed_d1_games,
+                   latest_adjusted_at, latest_pregame_at, issues_json
+            FROM data_health_runs ORDER BY run_id DESC LIMIT 20
+        """)
+        if health.empty:
+            st.info("The audit table exists but no checks have run. "
+                    "Run 'NCAA MBB Daily Data Health' in GitHub Actions.")
+        else:
+            h = health.iloc[0]
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Latest data health", str(h["status"]))
+            h2.metric("Recent completed D1 games", f"{int(h['recent_completed_d1_games']):,}")
+            h3.metric("Missing team box scores", f"{int(h['missing_box_scores']):,}")
+            h4.metric("Score mismatches", f"{int(h['score_mismatches']):,}")
+            st.caption(f"Checked {h['checked_at']} UTC · ESPN season {int(h['season'])} "
+                       f"· reviewed {h['window_start']} through {h['window_end']} "
+                       "(completed D1-vs-D1 games only; the most recent calendar day "
+                       "is excluded to allow delayed box scores).")
+            raw_issues = h.get("issues_json", "[]")
+            try:
+                issues = json.loads(raw_issues) if isinstance(raw_issues, str) else []
+            except (json.JSONDecodeError, TypeError, ValueError):
+                issues = ["Latest audit issues could not be decoded."]
+            if issues:
+                if str(h["status"]) == "ERROR":
+                    st.error("Latest health check found a critical data issue.")
+                else:
+                    st.warning("Latest health check found something to review.")
+                for issue in issues:
+                    st.write(f"• {issue}")
+            else:
+                st.success("No problems detected by the configured health checks.")
+            with st.expander("Last 20 health checks"):
+                display_cols = ["checked_at", "season", "status", "last_import_status",
+                                "recent_completed_d1_games", "missing_scores",
+                                "missing_box_scores", "invalid_possessions",
+                                "score_mismatches", "missing_pregame_pairs"]
+                show_table(health[display_cols].rename(columns={
+                    "checked_at": "Checked (UTC)", "season": "ESPN season",
+                    "status": "Health", "last_import_status": "ESPN import",
+                    "recent_completed_d1_games": "Recent D1 games",
+                    "missing_scores": "Missing scores",
+                    "missing_box_scores": "Box-score gaps",
+                    "invalid_possessions": "Invalid possessions",
+                    "score_mismatches": "Score mismatches",
+                    "missing_pregame_pairs": "Missing pregame pairs",
+                }))
+    st.divider()
+    st.markdown("#### ESPN import history")
     runs = query("""
         SELECT started_at,finished_at,status,dates_checked,games_seen,
                summaries_saved,errors FROM sync_runs ORDER BY run_id DESC LIMIT 20
