@@ -2249,11 +2249,244 @@ def exception_issue_summary(table: pd.DataFrame) -> pd.DataFrame:
                   .reset_index(name="Records"))
 
 
+
+# -----------------------------------------------------------------------------
+# MODEL PERFORMANCE (READ-ONLY ADDITION)
+# Uses the existing private server-side PostgreSQL connection. No client keys,
+# database mutations, live wagering features, or result-based refitting.
+# -----------------------------------------------------------------------------
+MODEL_SNAPSHOT_COVERAGE_SQL = """
+SELECT
+    s.model_version,
+    s.snapshot_stage,
+    COUNT(*)::integer AS snapshots,
+    COUNT(DISTINCT s.game_id)::integer AS unique_games,
+    COUNT(*) FILTER (WHERE s.tipoff_utc > NOW())::integer AS upcoming,
+    COUNT(*) FILTER (WHERE s.recorded_at >= s.tipoff_utc)::integer AS late,
+    COUNT(*) FILTER (
+        WHERE g.completed = 1 AND g.home_score IS NOT NULL
+              AND g.away_score IS NOT NULL
+    )::integer AS completed,
+    COUNT(*) FILTER (
+        WHERE s.tipoff_utc <= NOW() AND (g.completed = 0 OR g.game_id IS NULL)
+    )::integer AS awaiting_results,
+    ROUND(AVG(EXTRACT(EPOCH FROM (s.tipoff_utc - s.recorded_at))
+                  / 86400.0)::numeric, 2) AS avg_days_ahead,
+    MIN(s.recorded_at) AS first_recorded_at,
+    MAX(s.recorded_at) AS last_recorded_at
+FROM public.ncaa_mbb_projection_snapshots_v1 s
+LEFT JOIN public.games g ON g.game_id::text = s.game_id
+WHERE s.season = %s
+GROUP BY s.model_version, s.snapshot_stage
+ORDER BY s.model_version, s.snapshot_stage
+"""
+
+MODEL_COMPLETED_ACCURACY_SQL = """
+WITH eligible AS (
+    SELECT
+        s.model_version, s.snapshot_stage, s.game_id,
+        s.neutral_site, s.projected_home_points,
+        s.projected_away_points, s.projected_margin, s.projected_total,
+        g.home_score::numeric AS actual_home,
+        g.away_score::numeric AS actual_away,
+        EXTRACT(EPOCH FROM (s.tipoff_utc - s.recorded_at))
+            / 86400.0 AS days_ahead
+    FROM public.ncaa_mbb_projection_snapshots_v1 s
+    JOIN public.games g ON g.game_id::text = s.game_id
+    WHERE s.season = %s
+      AND g.completed = 1
+      AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+      AND g.home_team_id::text = s.home_team_id
+      AND g.away_team_id::text = s.away_team_id
+      AND s.recorded_at < s.tipoff_utc
+      AND NOT (
+        (g.home_score = 0 AND g.away_score = 2)
+        OR (g.home_score = 2 AND g.away_score = 0)
+      )
+), scored AS (
+    SELECT *,
+      CASE WHEN projected_margin = 0 OR actual_home = actual_away THEN NULL
+           WHEN (projected_margin > 0 AND actual_home > actual_away)
+             OR (projected_margin < 0 AND actual_home < actual_away)
+           THEN 1.0 ELSE 0.0 END AS winner_correct
+    FROM eligible
+)
+SELECT
+    model_version, snapshot_stage,
+    COUNT(*)::integer AS games_evaluated,
+    COUNT(*) FILTER (WHERE projected_margin = 0)::integer AS projected_ties,
+    ROUND(100 * AVG(winner_correct)::numeric, 2) AS winner_accuracy_pct,
+    ROUND(AVG(ABS(projected_home_points - actual_home))::numeric, 2)
+        AS home_score_mae,
+    ROUND(AVG(ABS(projected_away_points - actual_away))::numeric, 2)
+        AS away_score_mae,
+    ROUND(AVG(ABS(projected_margin - (actual_home - actual_away)))::numeric, 2)
+        AS margin_mae,
+    ROUND(AVG(ABS(projected_total - (actual_home + actual_away)))::numeric, 2)
+        AS total_mae,
+    ROUND(AVG(ABS(
+        (projected_total - CASE WHEN neutral_site = 1 THEN 2.81 ELSE 0 END)
+        - (actual_home + actual_away)
+    ))::numeric, 2) AS v2_shadow_total_mae,
+    ROUND(AVG(days_ahead)::numeric, 2) AS avg_days_ahead
+FROM scored
+GROUP BY model_version, snapshot_stage
+ORDER BY model_version, snapshot_stage
+"""
+
+MODEL_SNAPSHOT_COMPARISON_SQL = """
+WITH paired AS (
+    SELECT
+        i.game_id, i.recorded_at AS initial_time,
+        w.recorded_at AS updated_time,
+        i.tipoff_utc, i.projected_total AS initial_total,
+        w.projected_total AS updated_total,
+        i.projected_margin AS initial_margin,
+        w.projected_margin AS updated_margin,
+        (i.home_games <> w.home_games OR i.away_games <> w.away_games
+         OR i.home_offense <> w.home_offense
+         OR i.home_defense <> w.home_defense
+         OR i.away_offense <> w.away_offense
+         OR i.away_defense <> w.away_defense) AS stats_changed,
+        CASE WHEN g.completed = 1
+                  AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+                  AND g.home_team_id::text = i.home_team_id
+                  AND g.away_team_id::text = i.away_team_id
+                  AND NOT ((g.home_score = 0 AND g.away_score = 2)
+                           OR (g.home_score = 2 AND g.away_score = 0))
+             THEN (g.home_score + g.away_score)::numeric
+             ELSE NULL END AS actual_total
+    FROM public.ncaa_mbb_projection_snapshots_v1 i
+    JOIN public.ncaa_mbb_projection_snapshots_v1 w
+      ON i.game_id = w.game_id AND i.season = w.season
+    LEFT JOIN public.games g ON g.game_id::text = i.game_id
+    WHERE i.season = %s
+      AND i.model_version = 'V1' AND w.model_version = 'V1'
+      AND i.snapshot_stage = 'initial'
+      AND w.snapshot_stage = 'within_24h'
+)
+SELECT
+    COUNT(*)::integer AS paired_games,
+    COUNT(*) FILTER (WHERE updated_time > initial_time)::integer AS recorded_later,
+    COUNT(*) FILTER (WHERE stats_changed)::integer AS updated_team_stats,
+    COUNT(*) FILTER (
+        WHERE updated_total <> initial_total
+          OR updated_margin <> initial_margin
+    )::integer AS changed_forecasts,
+    COUNT(*) FILTER (WHERE actual_total IS NOT NULL)::integer AS completed_pairs,
+    ROUND(AVG(EXTRACT(EPOCH FROM (updated_time - initial_time))
+              / 3600.0)::numeric, 2) AS avg_hours_between,
+    ROUND(AVG(ABS(updated_total - initial_total))::numeric, 2)
+        AS avg_total_change,
+    ROUND(AVG(ABS(updated_margin - initial_margin))::numeric, 2)
+        AS avg_margin_change,
+    ROUND(AVG(ABS(initial_total - actual_total))::numeric, 2)
+        AS initial_total_mae_finished,
+    ROUND(AVG(ABS(updated_total - actual_total))::numeric, 2)
+        AS updated_total_mae_finished
+FROM paired
+"""
+
+# Set-based retrospective analysis of the saved V1 model configuration.
+# 2022-24 established the correction; 2025 selected a model; 2026 has
+# already been examined and must not be called an untouched holdout.
+MODEL_RETROSPECTIVE_SQL = """
+WITH pregame AS (
+    SELECT
+        g.season, g.game_id, g.neutral_site,
+        g.home_score::numeric AS actual_home,
+        g.away_score::numeric AS actual_away,
+        (g.home_pregame_ppg::numeric + g.away_defense_ppg::numeric)
+          / 2.0 AS baseline_home,
+        (g.away_pregame_ppg::numeric + g.home_defense_ppg::numeric)
+          / 2.0 AS baseline_away,
+        CASE WHEN g.neutral_site = 1
+             THEN m.neutral_margin_correction
+             ELSE m.home_margin_correction END AS correction
+    FROM public.ncaa_mbb_clean_games_v1 g
+    CROSS JOIN public.ncaa_mbb_basic_model_v1 m
+    WHERE g.season IN (2025, 2026)
+      AND g.neutral_site IN (0, 1)
+), projections AS (
+    SELECT
+        season, game_id, neutral_site, actual_home, actual_away,
+        ROUND(baseline_home + correction / 2.0, 2) AS predicted_home,
+        ROUND(baseline_away - correction / 2.0, 2) AS predicted_away,
+        ROUND((baseline_home - baseline_away) + correction, 2)
+          AS predicted_margin,
+        ROUND(baseline_home + baseline_away, 2) AS v1_total
+    FROM pregame
+)
+SELECT
+    season,
+    CASE WHEN neutral_site = 1 THEN 'Neutral site' ELSE 'Home court' END AS venue,
+    COUNT(*)::integer AS games,
+    COUNT(*) FILTER (WHERE predicted_margin = 0)::integer AS projected_ties,
+    ROUND(100.0 * COUNT(*) FILTER (
+      WHERE (predicted_margin > 0 AND actual_home > actual_away)
+         OR (predicted_margin < 0 AND actual_home < actual_away)
+    ) / NULLIF(COUNT(*) FILTER (WHERE predicted_margin <> 0), 0), 2)
+      AS winner_accuracy_pct,
+    ROUND(100.0 * COUNT(*) FILTER (
+        WHERE actual_home > actual_away AND predicted_margin <> 0
+    ) / NULLIF(COUNT(*) FILTER (WHERE predicted_margin <> 0), 0), 2)
+      AS always_home_accuracy_pct,
+    ROUND(AVG((ABS(predicted_home - actual_home)
+                  + ABS(predicted_away - actual_away)) / 2.0), 2)
+      AS team_score_mae,
+    ROUND(AVG(ABS(predicted_margin - (actual_home - actual_away))), 2)
+      AS margin_mae,
+    ROUND(AVG(ABS(v1_total - (actual_home + actual_away))), 2)
+      AS v1_total_mae,
+    ROUND(AVG(ABS((v1_total - CASE WHEN neutral_site = 1 THEN 2.81 ELSE 0 END)
+                  - (actual_home + actual_away))), 2)
+      AS v2_total_mae
+FROM projections
+GROUP BY season, neutral_site
+ORDER BY season DESC, neutral_site
+"""
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_model_snapshot_coverage(selected_season: int) -> pd.DataFrame:
+    return query(MODEL_SNAPSHOT_COVERAGE_SQL, (int(selected_season),))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_model_completed_accuracy(selected_season: int) -> pd.DataFrame:
+    return query(MODEL_COMPLETED_ACCURACY_SQL, (int(selected_season),))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_model_snapshot_comparison(selected_season: int) -> pd.DataFrame:
+    return query(MODEL_SNAPSHOT_COMPARISON_SQL, (int(selected_season),))
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_model_retrospective() -> pd.DataFrame:
+    return query(MODEL_RETROSPECTIVE_SQL)
+
+
+def model_metric(value, suffix: str = '', decimals: int = 2) -> str:
+    """Format nullable database aggregates for read-only dashboard metrics."""
+    if value is None or pd.isna(value):
+        return '—'
+    return f'{float(value):,.{decimals}f}{suffix}'
+
+
+def model_query_error(component: str, exc: Exception) -> None:
+    # Do not display raw connection errors (which may include server details).
+    logging.warning('Model Performance %s query failed: %s',
+                    component, type(exc).__name__)
+    st.warning('Could not read the ' + component + ' data. Check the corresponding '
+               'Supabase tables/views and the Streamlit database user\'s SELECT permissions.')
+
+
 st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
-    page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics",
+    page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics", "Model Performance",
                                     "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Historical Data Readiness", "Data Quality Exceptions", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
@@ -2519,6 +2752,191 @@ if page == "Verified Team Statistics":
                         "Weighted season averages; these results reflect only "
                         "the qualified-game subset, not the full NCAA schedule."
                     )
+
+
+elif page == "Model Performance":
+    st.subheader("Model Performance — NCAA Basketball Research")
+    st.caption(
+        "Read-only historical model evaluation and pregame snapshot monitoring. "
+        "No betting recommendations or automated wagering. "
+        "Current-season game forecasts are not guaranteed to predict outcomes."
+    )
+    st.info(
+        "The model uses pregame scoring averages and a location adjustment. "
+        "V1 is the originally saved forecast. V2 changes only neutral-site "
+        "projected totals by −2.81 points; its comparisons below are "
+        "hypothetical recalibrations of V1, not independently saved V2 forecasts."
+    )
+    section = st.radio(
+        "Performance section",
+        ["Snapshot coverage", "Completed-game accuracy",
+         "Historical evaluation", "Snapshot revisions"],
+        horizontal=True, key="model_performance_section",
+    )
+
+    if section == "Snapshot coverage":
+        st.markdown("#### Saved projection snapshots")
+        try:
+            coverage = load_model_snapshot_coverage(season)
+        except Exception as exc:
+            model_query_error('snapshot coverage', exc)
+        else:
+            if coverage.empty:
+                st.info(f"No prediction snapshots are stored for ESPN season {season}.")
+            else:
+                saved = int(coverage["snapshots"].sum())
+                late = int(coverage["late"].sum())
+                upcoming = int(coverage["upcoming"].sum())
+                complete = int(coverage["completed"].sum())
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Saved snapshots", f"{saved:,}")
+                m2.metric("Upcoming snapshots", f"{upcoming:,}")
+                m3.metric("Completed-game snapshots", f"{complete:,}")
+                m4.metric("Late snapshots", f"{late:,}")
+                table = coverage.rename(columns={
+                    "model_version": "Version", "snapshot_stage": "Stage",
+                    "snapshots": "Snapshots", "unique_games": "Unique games",
+                    "upcoming": "Upcoming", "completed": "Completed",
+                    "awaiting_results": "Past tipoff, awaiting result",
+                    "late": "Late", "avg_days_ahead": "Avg. lead time (days)",
+                    "first_recorded_at": "First saved (UTC)",
+                    "last_recorded_at": "Most recent (UTC)",
+                })
+                st.dataframe(table, hide_index=True, use_container_width=True)
+                st.caption(
+                    "A single game may appear in multiple stages. The totals above count "
+                    "saved snapshot records, not distinct games. A snapshot labeled "
+                    "'within_24h' is the first stored snapshot within that window; "
+                    "it is not necessarily the last forecast before tipoff."
+                )
+                st.download_button(
+                    "Download snapshot coverage CSV", data=table.to_csv(index=False),
+                    file_name=f"ncaa_model_snapshot_coverage_{season}.csv",
+                    mime="text/csv", key="model_coverage_download",
+                )
+
+    elif section == "Completed-game accuracy":
+        st.markdown("#### Accuracy from saved pregame snapshots")
+        try:
+            results = load_model_completed_accuracy(season)
+        except Exception as exc:
+            model_query_error('completed-game accuracy', exc)
+        else:
+            if results.empty:
+                st.info(
+                    "No eligible completed games with saved pregame snapshots yet. "
+                    "These measurements will populate when the imported final scores "
+                    "match your saved game records."
+                )
+            else:
+                table = results.rename(columns={
+                    "model_version": "Version", "snapshot_stage": "Stage",
+                    "games_evaluated": "Games evaluated",
+                    "projected_ties": "Projected ties",
+                    "winner_accuracy_pct": "Winner accuracy (%)",
+                    "home_score_mae": "Home score MAE",
+                    "away_score_mae": "Away score MAE",
+                    "margin_mae": "Margin MAE", "total_mae": "V1 total MAE",
+                    "v2_shadow_total_mae": "V2 shadow total MAE",
+                    "avg_days_ahead": "Avg. lead time (days)",
+                })
+                st.dataframe(table, hide_index=True, use_container_width=True)
+                st.caption(
+                    "Winner accuracy excludes tied projected margins. Lower MAE means "
+                    "smaller average absolute error in points. V2's shadow total MAE "
+                    "applies the fixed neutral-site correction to the saved V1 "
+                    "forecast; it is not a separately timestamped V2 prediction."
+                )
+                st.download_button(
+                    "Download completed-game metrics CSV",
+                    data=table.to_csv(index=False),
+                    file_name=f"ncaa_model_completed_accuracy_{season}.csv",
+                    mime="text/csv", key="model_accuracy_download",
+                )
+
+    elif section == "Historical evaluation":
+        st.markdown("#### Retrospective V1 / V2 comparison")
+        st.caption(
+            "Uses qualified 2025 and 2026 completed games from the clean-games view. "
+            "2022–2024 established the adjustment; 2025 was used in selection, "
+            "and 2026 results have already been examined. This is not an "
+            "untouched prospective evaluation."
+        )
+        try:
+            historical = load_model_retrospective()
+        except Exception as exc:
+            model_query_error('historical evaluation', exc)
+        else:
+            if historical.empty:
+                st.info("No qualified historical evaluation records are available.")
+            else:
+                table = historical.rename(columns={
+                    "season": "ESPN season", "venue": "Venue", "games": "Games",
+                    "projected_ties": "Projected ties",
+                    "winner_accuracy_pct": "V1 winner accuracy (%)",
+                    "always_home_accuracy_pct": "Always-home benchmark (%)",
+                    "team_score_mae": "V1 team-score MAE",
+                    "margin_mae": "V1 margin MAE", "v1_total_mae": "V1 total MAE",
+                    "v2_total_mae": "V2 total MAE",
+                })
+                st.dataframe(table, hide_index=True, use_container_width=True)
+                chart = table[["ESPN season", "Venue", "V1 total MAE", "V2 total MAE"]].copy()
+                for metric_col in ("V1 total MAE", "V2 total MAE"):
+                    chart[metric_col] = pd.to_numeric(chart[metric_col], errors="coerce")
+                chart["Season / venue"] = (chart["ESPN season"].astype(str)
+                                           + " · " + chart["Venue"])
+                st.bar_chart(chart.set_index("Season / venue")[[
+                    "V1 total MAE", "V2 total MAE"]])
+                st.caption(
+                    "The always-home rule is a minimal descriptive benchmark on "
+                    "the same qualified games. This page recalculates metrics "
+                    "from saved model parameters; it does not train new models "
+                    "or prove future predictive accuracy."
+                )
+                st.download_button(
+                    "Download historical comparison CSV",
+                    data=table.to_csv(index=False),
+                    file_name="ncaa_basic_model_historical_comparison.csv",
+                    mime="text/csv", key="model_historical_download",
+                )
+
+    else:  # Snapshot revisions
+        st.markdown("#### Original versus within-24-hour snapshots")
+        try:
+            pair = load_model_snapshot_comparison(season)
+        except Exception as exc:
+            model_query_error('snapshot revisions', exc)
+        else:
+            if pair.empty or int(pair.iloc[0]["paired_games"]) == 0:
+                st.info(f"No paired initial and within-24-hour snapshots for {season} yet.")
+            else:
+                row = pair.iloc[0]
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric("Games with both stages", f"{int(row['paired_games']):,}")
+                p2.metric("Updated team-stat records", f"{int(row['updated_team_stats']):,}")
+                p3.metric("Changed projections", f"{int(row['changed_forecasts']):,}")
+                p4.metric("Completed pairs", f"{int(row['completed_pairs']):,}")
+                st.metric("Average hours between snapshots",
+                          model_metric(row["avg_hours_between"], decimals=2))
+                diff_a, diff_b = st.columns(2)
+                diff_a.metric("Mean absolute change in total (pts)",
+                              model_metric(row["avg_total_change"]))
+                diff_b.metric("Mean absolute change in margin (pts)",
+                              model_metric(row["avg_margin_change"]))
+                if int(row["completed_pairs"]) > 0:
+                    e1, e2 = st.columns(2)
+                    e1.metric("Original total MAE on paired games",
+                              model_metric(row["initial_total_mae_finished"]))
+                    e2.metric("Updated total MAE on paired games",
+                              model_metric(row["updated_total_mae_finished"]))
+                else:
+                    st.info("No paired games have eligible final scores yet. "
+                            "Their comparative error statistics will appear when results arrive.")
+                st.caption(
+                    "We keep the first snapshot at each stage permanently. "
+                    "Snapshots taken minutes apart can be identical because "
+                    "no new completed-game statistics arrived between them."
+                )
 
 elif page == "Game schedules":
     st.subheader("Game schedules")
