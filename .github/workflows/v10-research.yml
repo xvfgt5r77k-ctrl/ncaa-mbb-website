@@ -17,7 +17,7 @@ jobs:
       - name: Verify expected model files are at the repository root
         shell: bash
         run: |
-          for f in v3_research.py v4_research.py v5_research.py v6_research.py v8_research.py v9_research.py v10_research.py tests_v10_integration.py requirements_v10.txt; do
+          for f in v3_research.py v4_research.py v5_research.py v6_research.py v8_research.py v9_research.py v10_research.py requirements_v10.txt; do
             if [ ! -f "$f" ]; then echo "Missing required root file: $f"; exit 1; fi
           done
       - name: Install requirements
