@@ -88,6 +88,159 @@ def query(sql: str, params: tuple = ()) -> pd.DataFrame:
 
 
 
+
+# -----------------------------------------------------------------------------
+# LIVE SCOREBOARD — separate from the nightly database importer
+# Streamlit fragment reruns every 10 minutes while this page is open.
+# The ESPN scoreboard endpoint is undocumented and can change or be unavailable.
+# No score is invented when the source is missing, and it is never saved as a
+# historical final score before the existing importer verifies completion.
+# -----------------------------------------------------------------------------
+ESPN_MBB_SCOREBOARD_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/basketball/"
+    "mens-college-basketball/scoreboard"
+)
+
+
+def parse_espn_scoreboard(payload: dict, central_tz=None) -> list[dict]:
+    """Pure transformation of ESPN scoreboard JSON; missing scores stay blank."""
+    tz = central_tz if central_tz is not None else CENTRAL
+    rows = []
+    events = payload.get("events", []) if isinstance(payload, dict) else []
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        competitions = event.get("competitions") or []
+        competition = competitions[0] if competitions and isinstance(competitions[0], dict) else {}
+        competitors = competition.get("competitors") or []
+        sides = {}
+        for competitor in competitors:
+            if not isinstance(competitor, dict):
+                continue
+            side = competitor.get("homeAway")
+            if side not in ("home", "away"):
+                continue
+            team = competitor.get("team") or {}
+            team = team if isinstance(team, dict) else {}
+            name = (team.get("displayName") or team.get("shortDisplayName")
+                    or team.get("name") or "Unknown team")
+            raw_score = competitor.get("score")
+            # Preserve valid zero scores; do not turn missing scores into 0–0.
+            score = str(raw_score) if raw_score is not None and str(raw_score) != "" else "—"
+            rank = competitor.get("curatedRank") or {}
+            rank_n = rank.get("current") if isinstance(rank, dict) else None
+            if isinstance(rank_n, int) and 1 <= rank_n <= 25:
+                name = f"#{rank_n} {name}"
+            sides[side] = (name, score)
+        if not all(side in sides for side in ("home", "away")):
+            continue
+        status = event.get("status") or {}
+        type_info = status.get("type") or {}
+        state = str(type_info.get("state") or "").lower()
+        if state == "in":
+            phase = "Live"
+        elif state == "post" or type_info.get("completed") is True:
+            phase = "Final"
+        elif state == "pre":
+            phase = "Upcoming"
+        else:
+            phase = "Other"
+        description = (type_info.get("shortDetail") or type_info.get("detail")
+                       or type_info.get("description") or phase)
+        start_iso = event.get("date") or competition.get("date")
+        tipoff = None
+        if isinstance(start_iso, str) and start_iso:
+            try:
+                tipoff = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                if tipoff.tzinfo is None:
+                    tipoff = tipoff.replace(tzinfo=timezone.utc)
+                tipoff = tipoff.astimezone(tz)
+            except ValueError:
+                pass
+        rows.append({
+            "game_id": str(event.get("id") or ""),
+            "Time (CT)": tipoff.strftime("%-I:%M %p") if tipoff else "—",
+            "Away": sides["away"][0], "Away score": sides["away"][1],
+            "Home": sides["home"][0], "Home score": sides["home"][1],
+            "Status": str(description), "phase": phase,
+            "sort_time": tipoff.isoformat() if tipoff else "",
+        })
+    priority = {"Live": 0, "Final": 1, "Upcoming": 2, "Other": 3}
+    return sorted(rows, key=lambda row: (priority[row["phase"]], row["sort_time"], row["game_id"]))
+
+
+@st.cache_data(ttl=540, show_spinner=False)
+def load_espn_live_results(day_key: str) -> tuple[list[dict], str]:
+    """Fetch all D1 games for a calendar day. Cached <10 minutes."""
+    if not re.fullmatch(r"\d{8}", day_key):
+        raise ValueError("Invalid scoreboard date")
+    response = requests.get(
+        ESPN_MBB_SCOREBOARD_URL,
+        params={"dates": day_key, "groups": "50", "limit": 500},
+        headers={"User-Agent": "NCAA-MBB-Research-Dashboard/1.0"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
+        raise ValueError("ESPN returned an unexpected scoreboard response")
+    checked = datetime.now(CENTRAL).strftime("%b %d, %Y at %I:%M %p CT")
+    return parse_espn_scoreboard(payload), checked
+
+
+@st.fragment(run_every="10m")
+def render_live_results():
+    """Refresh just the scoreboard, not every expensive database page."""
+    today = datetime.now(CENTRAL).date()
+    selection = st.radio("Date", ["Yesterday", "Today", "Tomorrow", "Pick a date"],
+                         index=1, horizontal=True, key="scoreboard_day_selection")
+    if selection == "Pick a date":
+        selected_day = st.date_input("Choose date (Central Time)", value=today,
+                                     key="scoreboard_custom_date")
+    else:
+        offset = {"Yesterday": -1, "Today": 0, "Tomorrow": 1}[selection]
+        selected_day = today + timedelta(days=offset)
+    try:
+        if st.button("Check scores now", key="scoreboard_refresh"):
+            load_espn_live_results.clear()
+        with st.spinner("Reading ESPN scoreboard…"):
+            games, fetched_at = load_espn_live_results(selected_day.strftime("%Y%m%d"))
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        logging.warning("ESPN scoreboard unavailable (%s)", type(exc).__name__)
+        st.warning("Live ESPN results are unavailable right now. Your saved "
+                   "database and other dashboard sections are unaffected. Try again shortly.")
+        return
+
+    st.caption(f"Showing {selected_day:%A, %B %d, %Y} · Last checked: {fetched_at} · "
+               "Next automatic check in approximately 10 minutes, while this tab remains open.")
+    live = sum(row["phase"] == "Live" for row in games)
+    finals = sum(row["phase"] == "Final" for row in games)
+    upcoming = sum(row["phase"] == "Upcoming" for row in games)
+    a, b, c, d = st.columns(4)
+    a.metric("Games", len(games))
+    b.metric("In progress", live)
+    c.metric("Final", finals)
+    d.metric("Upcoming", upcoming)
+    if not games:
+        st.info("ESPN does not currently list Division I games for this date.")
+        return
+    phases = st.radio("Show", ["All", "Live", "Final", "Upcoming"],
+                      index=0, horizontal=True, key="scoreboard_phase_filter")
+    search = st.text_input("Find a team", placeholder="Search school name…",
+                           key="scoreboard_team_search").strip()
+    visible = [g for g in games if (phases == "All" or g["phase"] == phases)
+               and (not search or search.casefold() in g["Home"].casefold()
+                    or search.casefold() in g["Away"].casefold())]
+    if not visible:
+        st.info("No games match your filters.")
+        return
+    columns = ["Time (CT)", "Away", "Away score", "Home", "Home score", "Status"]
+    st.dataframe(pd.DataFrame(visible)[columns], hide_index=True,
+                 use_container_width=True, height=min(700, 42 + 36 * len(visible)))
+    st.caption("Source: ESPN's unofficial Division I scoreboard feed. Times are Central. "
+               "Scores and status can lag the game; refresh is not a guarantee of "
+               "real-time delivery. This tab does not modify saved game results.")
+
 # -----------------------------------------------------------------------------
 # VERIFIED HISTORICAL TEAM STATISTICS (ADDED TO THE ORIGINAL DASHBOARD)
 # Public-facing descriptive summaries come from the precomputed Supabase view.
@@ -2486,7 +2639,7 @@ st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
-    page = st.radio("Section", ["Game schedules", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics", "Model Performance",
+    page = st.radio("Section", ["Game schedules", "Live results", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics", "Model Performance",
                                     "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Historical Data Readiness", "Data Quality Exceptions", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
@@ -2937,6 +3090,13 @@ elif page == "Model Performance":
                     "Snapshots taken minutes apart can be identical because "
                     "no new completed-game statistics arrived between them."
                 )
+
+elif page == "Live results":
+    st.subheader("Live NCAA Men's Basketball Results")
+    st.caption("Scores fetched from ESPN Division I scoreboard; automatically checked "
+               "every 10 minutes while this page is open. This is separate from "
+               "the nightly Supabase statistics import.")
+    render_live_results()
 
 elif page == "Game schedules":
     st.subheader("Game schedules")
