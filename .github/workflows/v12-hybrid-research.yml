@@ -1,0 +1,40 @@
+name: NCAA MBB V12 Guarded Hybrid Historical Research
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hybrid-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements_v12.txt
+      - name: Verify required files at repository root
+        run: |
+          for f in v3_research.py v4_research.py v5_research.py v6_research.py v8_research.py v9_research.py v10_research.py v11_research.py v12_hybrid_research.py requirements_v12.txt; do
+            if [ ! -f "$f" ]; then echo "Missing file at repository root: $f"; exit 1; fi
+          done
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements_v12.txt
+      - name: Check hybrid logic and weighting rules
+        run: python v12_hybrid_research.py --self-test
+      - name: Evaluate historical NCAA model ensemble
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENBLAS_NUM_THREADS: '2'
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+        run: python v12_hybrid_research.py
+      - name: Upload historical report even if analysis fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-v12-hybrid-historical-report
+          path: v12_results/
+          if-no-files-found: warn
+          retention-days: 30
