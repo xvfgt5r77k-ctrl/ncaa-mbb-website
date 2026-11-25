@@ -2639,7 +2639,7 @@ st.title("🏀 NCAA Men's Basketball Database")
 st.caption("Division I • ESPN game statistics • opponent-adjusted SOS & historical data • Central Time")
 with st.sidebar:
     st.header("Navigation")
-    page = st.radio("Section", ["Game schedules", "Live results", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics", "Model Performance",
+    page = st.radio("Section", ["Game schedules", "Live results", "V7 Historical Predictions", "Teams & conferences", "Team efficiency", "Team explorer", "Verified Team Statistics", "Model Performance",
                                     "Player season averages", "Adjusted SOS", "Historical team trends", "Historical Team Comparison", "Historical Data Quality", "Historical Scoring Review", "Statistical Feature Analysis", "Statistical Reliability Report", "Historical Scoring Accuracy", "Validation vs Holdout", "Season Data Drift", "Historical Data Readiness", "Data Quality Exceptions", "Advanced Matchup Comparison", "Historical Pregame Replay", "Injuries", "Update status"], label_visibility="collapsed")
     if st.button("Refresh displayed data", use_container_width=True):
         st.cache_data.clear()
@@ -3090,6 +3090,61 @@ elif page == "Model Performance":
                     "Snapshots taken minutes apart can be identical because "
                     "no new completed-game statistics arrived between them."
                 )
+
+elif page == "V7 Historical Predictions":
+    st.subheader("V7 Historical Predictions — Completed Games")
+    st.caption("Read-only comparison of V7 winner estimates and projected combined score "
+               "against actual *completed* NCAA games from 2025–26. "
+               "This does not provide predictions for live or upcoming games.")
+    csv_file = Path(__file__).resolve().parent / "v7_historical_2026_predictions.csv"
+    if not csv_file.is_file():
+        st.info("Run the V7 GitHub research workflow, download its artifact, "
+                "then upload historical_2026_predictions.csv to your repository "
+                "root renamed as v7_historical_2026_predictions.csv. "
+                "The page will populate after the next Streamlit deployment.")
+    else:
+        try:
+            history = pd.read_csv(csv_file, dtype={"game_id":str,"home_team_id":str,"away_team_id":str})
+            necessary = {"game_date", "home_team", "away_team", "predicted_winner",
+                         "predicted_winner_correct", "projected_total", "actual_total",
+                         "home_score", "away_score", "home_win_prob"}
+            if not necessary.issubset(history.columns):
+                st.warning("V7 CSV is missing required fields; use the unmodified V7 artifact export.")
+            elif history.empty:
+                st.info("No completed V7 research games are available yet.")
+            else:
+                history["game_date"] = pd.to_datetime(history["game_date"], errors="coerce")
+                for col in ("predicted_winner_correct","projected_total", "actual_total", "home_win_prob"):
+                    history[col] = pd.to_numeric(history[col], errors="coerce")
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Reviewed completed games",len(history))
+                c2.metric("Historical winner accuracy", f"{history.predicted_winner_correct.mean()*100:.2f}%")
+                c3.metric("Historical total MAE",f"{(history.projected_total-history.actual_total).abs().mean():.2f} pts")
+                search = st.text_input("Search completed-game team", key="v7_archive_search").strip().casefold()
+                shown = history.copy()
+                if search:
+                    shown = shown[shown.home_team.astype(str).str.casefold().str.contains(search, regex=False)
+                                | shown.away_team.astype(str).str.casefold().str.contains(search, regex=False)]
+                shown = shown.sort_values("game_date", ascending=False).copy()
+                shown["Date"] = shown.game_date.dt.strftime("%b %d, %Y")
+                shown["Correct"] = shown.predicted_winner_correct.map({1:"Yes",0:"No"})
+                shown["Home win estimate"] = (shown.home_win_prob*100).round(1).astype(str)+"%"
+                shown["Projected total"] = shown.projected_total.round(1)
+                shown["Actual total"] = shown.actual_total.round(0)
+                st.dataframe(shown[["Date","away_team","home_team","predicted_winner",
+                                    "Home win estimate","Projected total","Actual total", "Correct",
+                                    "away_score","home_score"]].rename(columns={
+                     "away_team":"Away","home_team":"Home","predicted_winner":"Predicted winner",
+                     "away_score":"Away final","home_score":"Home final"}),
+                     hide_index=True, use_container_width=True)
+                st.download_button("Download historical comparison CSV",
+                    shown.to_csv(index=False).encode("utf-8"),
+                    file_name="v7_completed_game_comparison.csv",mime="text/csv")
+                st.caption("Historical estimates are not live selections. 2026 was reviewed "
+                           "during previous model development and is not an untouched holdout.")
+        except (OSError, ValueError, KeyError) as exc:
+            logging.warning("V7 historical archive unavailable: %s", type(exc).__name__)
+            st.warning("Could not display the V7 archive. Check the CSV upload.")
 
 elif page == "Live results":
     st.subheader("Live NCAA Men's Basketball Results")
