@@ -2540,6 +2540,55 @@ SELECT
 FROM paired
 """
 
+# Prospective 2027 integrity dashboard: summary only, no current-game selections.
+# The scheduled GitHub audit reports stricter completed-game classifications.
+MODEL_2027_INTEGRITY_SQL = """
+WITH checked AS (
+    SELECT s.model_version, s.snapshot_stage, s.game_id,
+        s.recorded_at, s.tipoff_utc,
+        g.game_id AS matched,
+        g.completed, g.home_score, g.away_score,
+        NULLIF(g.start_time_utc::text, '')::timestamptz AS current_tipoff,
+        (g.home_team_id::text IS DISTINCT FROM s.home_team_id
+         OR g.away_team_id::text IS DISTINCT FROM s.away_team_id)
+            AS changed_opponents,
+        (g.neutral_site::text IS DISTINCT FROM s.neutral_site::text)
+            AS changed_venue
+    FROM public.ncaa_mbb_projection_snapshots_v1 s
+    LEFT JOIN public.games g ON g.game_id::text = s.game_id
+    WHERE s.season = 2027
+)
+SELECT model_version, snapshot_stage,
+       COUNT(*)::int AS saved_snapshots,
+       COUNT(*) FILTER (WHERE matched IS NULL)::int AS missing_games,
+       COUNT(*) FILTER (WHERE matched IS NOT NULL
+           AND changed_opponents)::int AS changed_opponents,
+       COUNT(*) FILTER (WHERE matched IS NOT NULL
+           AND changed_venue)::int AS changed_venue,
+       COUNT(*) FILTER (WHERE current_tipoff IS NOT NULL
+           AND ABS(EXTRACT(EPOCH FROM (current_tipoff - tipoff_utc))) > 600
+           )::int AS changed_tipoffs,
+       COUNT(*) FILTER (WHERE recorded_at >= tipoff_utc OR
+           (current_tipoff IS NOT NULL AND recorded_at >= current_tipoff)
+           )::int AS not_saved_before_tipoff,
+       COUNT(*) FILTER (WHERE matched IS NOT NULL AND completed = 1
+           AND home_score IS NOT NULL AND away_score IS NOT NULL
+           AND NOT ((home_score = 0 AND away_score = 2)
+                 OR (home_score = 2 AND away_score = 0))
+           )::int AS imported_final_scores,
+       COUNT(*) FILTER (WHERE matched IS NOT NULL AND completed = 0
+           AND current_tipoff <= NOW())::int AS awaiting_imported_final,
+       COUNT(*) FILTER (WHERE current_tipoff > NOW())::int AS future_games
+FROM checked
+GROUP BY model_version, snapshot_stage
+ORDER BY model_version, snapshot_stage
+"""
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_2027_integrity_monitor() -> pd.DataFrame:
+    return query(MODEL_2027_INTEGRITY_SQL)
+
+
 # Set-based retrospective analysis of the saved V1 model configuration.
 # 2022-24 established the correction; 2025 selected a model; 2026 has
 # already been examined and must not be called an untouched holdout.
@@ -2923,7 +2972,7 @@ elif page == "Model Performance":
     section = st.radio(
         "Performance section",
         ["Snapshot coverage", "Completed-game accuracy",
-         "Historical evaluation", "Snapshot revisions"],
+         "Prospective 2027 monitor", "Historical evaluation", "Snapshot revisions"],
         horizontal=True, key="model_performance_section",
     )
 
@@ -3005,6 +3054,45 @@ elif page == "Model Performance":
                     data=table.to_csv(index=False),
                     file_name=f"ncaa_model_completed_accuracy_{season}.csv",
                     mime="text/csv", key="model_accuracy_download",
+                )
+
+    elif section == "Prospective 2027 monitor":
+        st.markdown("#### ESPN season 2027 — saved-forecast audit")
+        st.caption(
+            "Uses already-saved snapshots and the current Supabase game records. "
+            "Upcoming selections are not displayed. This section does not create new forecasts."
+        )
+        try:
+            audit_2027 = load_2027_integrity_monitor()
+            complete_2027 = load_model_completed_accuracy(2027)
+        except Exception as exc:
+            model_query_error('2027 prospective monitoring', exc)
+        else:
+            if audit_2027.empty:
+                st.info("No saved snapshots exist for ESPN season 2027 yet.")
+            else:
+                late = int(audit_2027['not_saved_before_tipoff'].sum())
+                changed = int(audit_2027['changed_tipoffs'].sum())
+                scores = int(audit_2027['imported_final_scores'].sum())
+                wait = int(audit_2027['awaiting_imported_final'].sum())
+                a,b,c,d = st.columns(4)
+                a.metric("Snapshot records", f"{int(audit_2027['saved_snapshots'].sum()):,}")
+                b.metric("Imported final-score records", f"{scores:,}")
+                c.metric("Awaiting imported result", f"{wait:,}")
+                d.metric("Late / changed tipoff records", f"{late+changed:,}")
+                st.dataframe(audit_2027, hide_index=True, use_container_width=True)
+                st.markdown("##### Completed-game scorecard")
+                if complete_2027.empty:
+                    st.info("No completed games have qualified for the saved-snapshot accuracy view yet.")
+                else:
+                    st.dataframe(complete_2027, hide_index=True, use_container_width=True)
+                st.caption(
+                    "These are snapshot *records*, not necessarily unique games: original "
+                    "and within-24-hour records are separate. The GitHub daily audit additionally "
+                    "excludes rescheduled, changed-opponent, and invalid forecasts from its strict "
+                    "accuracy calculations. Timestamps alone cannot prove that the inputs were "
+                    "available before tipoff. No V5/V8/V12 prospective accuracy exists until "
+                    "those versions have saved pregame snapshots."
                 )
 
     elif section == "Historical evaluation":
