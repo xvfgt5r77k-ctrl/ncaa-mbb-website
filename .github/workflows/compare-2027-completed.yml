@@ -61,9 +61,11 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add data/v1_v8_v12_completed_2027_summary.csv \
-                  data/v1_v8_v12_completed_2027_games.csv \
-                  data/v1_v8_v12_audit.json
+          # The repository's .gitignore excludes data/. Force-add only the
+          # three generated public research outputs, not the whole directory.
+          git add -f -- data/v1_v8_v12_completed_2027_summary.csv \
+                        data/v1_v8_v12_completed_2027_games.csv \
+                        data/v1_v8_v12_audit.json
           if git diff --cached --quiet; then
             echo 'No changes to completed-game results.'
           else
