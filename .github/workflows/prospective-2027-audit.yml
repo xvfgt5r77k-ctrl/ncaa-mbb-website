@@ -1,0 +1,40 @@
+name: NCAA MBB 2027 Prospective Accuracy Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 14:15 UTC every day; after the existing overnight ESPN import / noon UTC refresh.
+    - cron: '15 14 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ncaa-mbb-2027-prospective-audit
+  cancel-in-progress: false
+
+jobs:
+  prospective-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests (no Supabase required)
+        run: python -m unittest discover -s tests -p 'test_prospective_monitor.py' -v
+      - name: Install read-only Postgres client
+        run: python -m pip install 'psycopg[binary]>=3.2,<4'
+      - name: Evaluate completed games from saved pre-tipoff snapshots
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python prospective_monitor.py --season 2027 --output-dir prospective_2027_results
+      - name: Upload completed-game audit (no upcoming picks)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-2027-prospective-audit
+          path: prospective_2027_results/
+          if-no-files-found: warn
+          retention-days: 90
