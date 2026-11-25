@@ -1,0 +1,74 @@
+name: NCAA MBB 2027 V1 V8 V12 Completed-Game Comparison
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 14:45 UTC each day, after the existing overnight ESPN import and V1 audit.
+    - cron: '45 14 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ncaa-2027-completed-model-comparison
+  cancel-in-progress: false
+
+jobs:
+  completed-historical-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements_2027_comparison.txt
+      - name: Check model files and archived selection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          required = ['v3_research.py','v4_research.py','v5_research.py',
+                      'v6_research.py','v8_research.py','v9_research.py',
+                      'v10_research.py','v11_research.py','v12_hybrid_research.py',
+                      'prospective_monitor.py','compare_completed_2027.py',
+                      'archived_2026_selected_models.json']
+          missing = [x for x in required if not Path(x).is_file()]
+          if missing: raise SystemExit('Missing repo-root files: '+', '.join(missing))
+          print('All model files present')
+          PY
+      - name: Install research dependencies
+        run: python -m pip install -r requirements_2027_comparison.txt
+      - name: Run offline timing and comparison tests
+        run: python -m unittest discover -s tests -p 'test_completed_2027_compare.py' -v
+      - name: Research comparison on imported COMPLETED games only
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python compare_completed_2027.py \
+            --output-dir completed_2027_comparison_results \
+            --dashboard-data-dir data
+      - name: Upload completed-game research and timing audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-2027-v1-v8-v12-comparison
+          path: completed_2027_comparison_results/
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Publish research-only completed-game CSVs to dashboard
+        if: success() && github.ref_name == 'main'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/v1_v8_v12_completed_2027_summary.csv \
+                  data/v1_v8_v12_completed_2027_games.csv \
+                  data/v1_v8_v12_audit.json
+          if git diff --cached --quiet; then
+            echo 'No changes to completed-game results.'
+          else
+            git commit -m 'Update completed-game 2027 research comparison'
+            if ! git push origin HEAD:main; then
+              echo 'WARNING: Could not push comparison data. Download artifact and upload data/ CSVs manually.'
+            fi
+          fi
