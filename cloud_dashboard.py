@@ -2972,7 +2972,7 @@ elif page == "Model Performance":
     section = st.radio(
         "Performance section",
         ["Snapshot coverage", "Completed-game accuracy",
-         "Prospective 2027 monitor", "Historical evaluation", "Snapshot revisions"],
+         "Prospective 2027 monitor", "V1 / V8 / V12 completed-game comparison", "Historical evaluation", "Snapshot revisions"],
         horizontal=True, key="model_performance_section",
     )
 
@@ -3094,6 +3094,63 @@ elif page == "Model Performance":
                     "available before tipoff. No V5/V8/V12 prospective accuracy exists until "
                     "those versions have saved pregame snapshots."
                 )
+
+    elif section == "V1 / V8 / V12 completed-game comparison":
+        st.markdown("#### 2027 completed-game model comparison")
+        st.caption(
+            "V1 original forecasts were independently saved before tipoff and checked for "
+            "schedule changes. V8 Hybrid and V12 are **retrospective reconstructions** "
+            "using historical model specifications—not independently saved V8/V12 "
+            "pregame forecasts. Only completed games appear here."
+        )
+        data_dir = Path(__file__).resolve().parent / "data"
+        summary_path = data_dir / "v1_v8_v12_completed_2027_summary.csv"
+        games_path = data_dir / "v1_v8_v12_completed_2027_games.csv"
+        if not summary_path.is_file():
+            st.info(
+                "The completed-game comparison hasn't been published to GitHub yet. "
+                "Run 'NCAA MBB 2027 V1 V8 V12 Completed-Game Comparison' in GitHub Actions. "
+                "If the workflow cannot commit data, manually upload its CSV files to the data/ folder."
+            )
+        else:
+            try:
+                comparison = pd.read_csv(summary_path)
+                required = {"scope", "model", "evaluation_type", "games", "winner_accuracy_pct", "total_mae"}
+                if comparison.empty or not required.issubset(comparison.columns):
+                    st.warning("The comparison CSV is empty or missing required columns.")
+                else:
+                    matching = comparison[comparison.scope == "matched_three_models"].copy()
+                    if not matching.empty:
+                        st.markdown("##### Same-game comparison (V1, V8, and V12)")
+                        st.dataframe(matching, hide_index=True, use_container_width=True)
+                        graph = matching.set_index("model")[["winner_accuracy_pct"]]
+                        st.bar_chart(graph)
+                        st.caption(
+                            "This matched sample excludes invalid, late, or changed V1 original forecasts. "
+                            "V8 and V12 were reconstructed only after games finished; the comparison "
+                            "is informative but is not a prospective head-to-head test."
+                        )
+                    else:
+                        st.info("No three-model matched completed games yet. Partial results are below.")
+                    st.markdown("##### All reconstructed completed games and close-game analysis")
+                    st.dataframe(comparison, hide_index=True, use_container_width=True)
+                    st.download_button("Download comparison summary CSV", comparison.to_csv(index=False),
+                        file_name="v1_v8_v12_completed_2027_summary.csv", mime="text/csv")
+                    if games_path.is_file():
+                        completed_details = pd.read_csv(games_path)
+                        st.markdown("##### Completed-game research records")
+                        st.dataframe(completed_details.tail(100).iloc[::-1],
+                                     hide_index=True, use_container_width=True)
+                        st.download_button("Download completed-game diagnostics CSV",
+                            completed_details.to_csv(index=False),
+                            file_name="v1_v8_v12_completed_2027_games.csv", mime="text/csv")
+                    st.caption(
+                        "The historical ratings used by V8 Hybrid have not been fully audited for "
+                        "their original publication time. This dashboard does not make new "
+                        "upcoming-game or live-game forecasts."
+                    )
+            except Exception as exc:
+                st.warning(f"The completed-game comparison CSV could not be read: {exc}")
 
     elif section == "Historical evaluation":
         st.markdown("#### Retrospective V1 / V2 comparison")
