@@ -1,8 +1,8 @@
 scope,model,evaluation_type,games,correct_winners,winner_accuracy_pct,total_mae,always_home_pct
-all_2027_replay_eligible,V8 hybrid retrospective,reconstructed_after_game,108,75,69.44,,63.89
-all_2027_replay_eligible,V12 selected retrospective,reconstructed_after_game,108,78,72.22,13.862,63.89
-matched_three_models,V1 original pretipoff,saved_pretipoff,40,29,72.5,14.364,70.0
-matched_three_models,V8 hybrid retrospective,reconstructed_after_game,40,29,72.5,,70.0
-matched_three_models,V12 selected retrospective,reconstructed_after_game,40,31,77.5,12.815,70.0
-elo_close_replay_eligible,V8 hybrid retrospective,reconstructed_after_game,104,71,68.27,,62.5
-elo_close_replay_eligible,V12 selected retrospective,reconstructed_after_game,104,74,71.15,13.764,62.5
+all_2027_replay_eligible,V8 hybrid retrospective,reconstructed_after_game,148,99,66.89,,64.19
+all_2027_replay_eligible,V12 selected retrospective,reconstructed_after_game,148,102,68.92,13.924,64.19
+matched_three_models,V1 original pretipoff,saved_pretipoff,64,44,68.75,15.259,71.88
+matched_three_models,V8 hybrid retrospective,reconstructed_after_game,64,45,70.31,,71.88
+matched_three_models,V12 selected retrospective,reconstructed_after_game,64,47,73.44,14.169,71.88
+elo_close_replay_eligible,V8 hybrid retrospective,reconstructed_after_game,140,91,65.0,,62.14
+elo_close_replay_eligible,V12 selected retrospective,reconstructed_after_game,140,94,67.14,13.628,62.14
