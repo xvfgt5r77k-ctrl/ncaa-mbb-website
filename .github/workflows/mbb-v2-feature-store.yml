@@ -1,0 +1,33 @@
+name: NCAA MBB Feature Store V2 Refresh
+on:
+  workflow_dispatch:
+  schedule:
+    # 14:30 UTC daily (8:30 a.m. CST / 9:30 a.m. CDT).
+    # Schedule after the nighttime ESPN ingestion workflow.
+    - cron: '30 14 * * *'
+permissions:
+  contents: read
+jobs:
+  refresh-feature-store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependency
+        run: python -m pip install -r requirements_db_upgrade.txt
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p 'test_db_upgrade.py' -v
+      - name: Refresh V2 player and team features
+        run: python db_upgrade_v2.py --output-dir feature_store_audit
+      - name: Upload feature-store audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-v2-feature-store-audit
+          path: feature_store_audit/
+          if-no-files-found: warn
