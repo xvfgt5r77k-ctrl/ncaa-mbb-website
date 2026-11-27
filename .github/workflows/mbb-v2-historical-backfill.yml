@@ -1,0 +1,114 @@
+name: NCAA MBB V2 Historical Backfill (2022-2026)
+
+run-name: "Historical feature backfill: season ${{ inputs.season }}${{ inputs.dry_run && ' [dry run]' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "ESPN ending-year season. Run one season at a time."
+        required: true
+        type: choice
+        default: '2022'
+        options:
+          - '2022'
+          - '2023'
+          - '2024'
+          - '2025'
+          - '2026'
+      dry_run:
+        description: "Check inputs and generate audit only; do not write to Supabase"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize runs of this manual workflow for a season. The existing 2027
+# feature-store refresh uses a separate workflow; this backfill cannot touch 2027.
+concurrency:
+  group: mbb-v2-historical-backfill-${{ inputs.season }}
+  cancel-in-progress: false
+
+jobs:
+  backfill-historical-season:
+    runs-on: ubuntu-latest
+    timeout-minutes: 105
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SEASON: ${{ inputs.season }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check necessary files and season guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$SEASON" in
+            2022|2023|2024|2025|2026) ;;
+            *) echo "Error: only seasons 2022 to 2026 may be backfilled" >&2; exit 1 ;;
+          esac
+          test -f db_upgrade_v2.py || { echo "Missing db_upgrade_v2.py at repository root" >&2; exit 1; }
+          test -f requirements_db_upgrade.txt || { echo "Missing requirements_db_upgrade.txt" >&2; exit 1; }
+          test -f tests/test_db_upgrade.py || { echo "Missing tests/test_db_upgrade.py" >&2; exit 1; }
+          if [[ -z "${DATABASE_URL:-}" ]]; then
+            echo "Missing GitHub Actions secret DATABASE_URL" >&2
+            exit 1
+          fi
+          echo "Backfill season: $SEASON | dry run: $DRY_RUN"
+
+      - name: Install Python dependency
+        run: python -m pip install -r requirements_db_upgrade.txt
+
+      - name: Run existing feature-store safety tests
+        run: python -m unittest discover -s tests -p 'test_db_upgrade.py' -v
+
+      - name: Backfill selected historical season only
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--min-season "$SEASON" --max-season "$SEASON" --output-dir "historical_backfill_audit/$SEASON")
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python db_upgrade_v2.py "${args[@]}"
+
+      - name: Validate audit (historical-only)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          season = os.environ['SEASON']
+          audit = json.loads((Path('historical_backfill_audit') / season / 'audit.json').read_text())
+          completed = audit.get('historical_replay_games', 0)
+          if completed <= 0:
+              raise SystemExit('No completed D1 games generated historical replay rows')
+          if audit.get('prospective_games', 0) != 0:
+              raise SystemExit('Unexpected prospective rows in a historical-season run')
+          if audit.get('feature_team_rows', 0) != completed * 2:
+              raise SystemExit('Historical team-feature count does not match two teams per game')
+          print('Audit OK: historical replay games:', completed)
+          print('Team feature rows calculated:', audit.get('feature_team_rows'))
+          print('Player feature rows calculated:', audit.get('feature_player_rows'))
+          print('Team rows newly inserted:', audit.get('team_rows_inserted', 'dry run'))
+          print('Player rows newly inserted:', audit.get('player_rows_inserted', 'dry run'))
+          print('Unchanged rows preserved by ON CONFLICT DO NOTHING')
+          PY
+
+      - name: Upload historical-backfill audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-v2-backfill-${{ inputs.season }}
+          path: historical_backfill_audit/
+          if-no-files-found: warn
+          retention-days: 30
