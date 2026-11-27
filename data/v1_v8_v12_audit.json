@@ -1,18 +1,18 @@
 {
   "evaluation_season": 2027,
-  "generated_utc": "2026-11-26T23:19:12.335459+00:00",
-  "replayed_2027_games": 148,
-  "v1_valid_original_snapshots_all_2027": 96,
-  "v1_valid_original_snapshots_on_replay_games": 64,
+  "generated_utc": "2026-11-27T22:56:39.551502+00:00",
+  "replayed_2027_games": 168,
+  "v1_valid_original_snapshots_all_2027": 102,
+  "v1_valid_original_snapshots_on_replay_games": 70,
   "v1_original_snapshot_record_status": {
-    "upcoming:scheduled": 445,
-    "evaluated:valid_pretipoff_completed_game": 96,
-    "awaiting_result:past_tipoff_no_verified_result": 5,
-    "excluded:rescheduled_since_snapshot": 11,
-    "excluded:opponent_ids_changed": 15
+    "awaiting_result:past_tipoff_no_verified_result": 18,
+    "upcoming:scheduled": 418,
+    "evaluated:valid_pretipoff_completed_game": 102,
+    "excluded:rescheduled_since_snapshot": 13,
+    "excluded:opponent_ids_changed": 21
   },
-  "raw_2027_qualified": 272,
-  "scores_2027_replayed": 1118,
+  "raw_2027_qualified": 292,
+  "scores_2027_replayed": 1138,
   "v8_model_reconstructed_not_2027_saved": true,
   "v12_model_reconstructed_not_2027_saved": true,
   "model_training_seasons": [
@@ -49,14 +49,14 @@
     "v12_hybrid_research.py": "9b87738b78ebfe6e"
   },
   "replay_audit": {
-    "rows_before_baseline_filter": 24152,
-    "rows_after_baseline_filter": 24152,
+    "rows_before_baseline_filter": 24172,
+    "rows_after_baseline_filter": 24172,
     "invalid_prior_rating_rows_home": 0,
     "invalid_prior_rating_rows_away": 0,
     "adjusted_net_pair_available_pct": 100.0,
     "sos_pair_available_pct": 100.0,
-    "v3_qualified_before_strict_filter": 24152,
-    "matched_chronological_games": 23303,
+    "v3_qualified_before_strict_filter": 24172,
+    "matched_chronological_games": 23323,
     "excluded_insufficient_prior_day_games": 849,
     "strict_fields": [
       "strict_ppg_margin",
@@ -77,8 +77,8 @@
     "hybrid_uses_v3_upstream_fields_not_fully_audited": true,
     "strict_data_cutoff": "previous calendar day only; no same-day outcomes",
     "eligibility_uses_historical_game_labels_and_v3_quality_checks": true,
-    "scoreboard_games_replayed": 29214,
-    "games_with_valid_box_scores": 29206,
+    "scoreboard_games_replayed": 29234,
+    "games_with_valid_box_scores": 29226,
     "games_without_valid_box_scores": 8,
     "box_score_valid_pct": 99.97,
     "same_day_results_used_as_features": false,
@@ -99,11 +99,11 @@
     "games_with_two_sided_reports": 0,
     "player_availability_reason": "Historical pretipoff player data are absent or insufficient",
     "v6_valid_historical_box_games_by_category": {
-      "shooting": 29206,
-      "turnovers": 29206,
-      "rebounds": 29206,
-      "free_throws": 29206,
-      "elo_opponent_adjusted_games": 29206,
+      "shooting": 29226,
+      "turnovers": 29226,
+      "rebounds": 29226,
+      "free_throws": 29226,
+      "elo_opponent_adjusted_games": 29226,
       "invalid_base_box": 8
     },
     "v6_lagged_game_cutoff": "previous calendar date (not game day)",
@@ -115,7 +115,7 @@
     "new_opponent_non_null_pct": 100.0,
     "new_context_non_null_pct": 100.0,
     "v9_scoring_replay": {
-      "scoring_valid_historical_box_games": 29205,
+      "scoring_valid_historical_box_games": 29225,
       "scoring_replayer_same_day_leakage": false
     }
   },
