@@ -1,6 +1,7 @@
 """NCAA MBB retrospective, read-only ESPN CORE predictor feasibility test.
 
 Queries only FINISHED 2026 games from a pre-existing archived research dataset.
+Samples across calendar months to avoid relying on a short part of the season.
 No future games, pregame alerts, odds, betting logic, database modifications, or model training.
 Retrieved-after-final ESPN predictor fields do NOT establish pretipoff validity.
 """
@@ -122,6 +123,60 @@ def fetch_core_predictor(session: requests.Session, game_id: str,
     return row
 
 
+def sample_across_months(df: pd.DataFrame, max_games: int) -> pd.DataFrame:
+    """Deterministic month-balanced historical sample, ~half competitive.
+
+    Equal-month allocation is a deliberate diagnostic sample, NOT a
+    schedule-representative estimate of the entire NCAA season.
+    """
+    import hashlib
+    if not 2 <= max_games <= 500:
+        raise ValueError('max_games must be between 2 and 500')
+    if df.empty:
+        raise ValueError('No eligible historical games')
+    if df['game_id'].astype(str).duplicated().any():
+        raise ValueError('Duplicate game IDs in historical reference')
+    temp = df.copy()
+    dates = pd.to_datetime(temp['game_date'], format='%Y-%m-%d', errors='coerce')
+    if dates.isna().any():
+        raise ValueError('Unparseable historical game_date')
+    temp['_month'] = dates.dt.strftime('%Y-%m')
+    temp['_priority'] = temp['game_id'].astype(str).map(
+        lambda gid: hashlib.sha256(('espn-core-500-monthly-v1:' + gid).encode()).hexdigest()
+    )
+    months = sorted(temp['_month'].unique())
+    allocations = {m: 0 for m in months}
+    capacities = temp['_month'].value_counts().to_dict()
+    target = min(max_games, len(temp))
+    # Water-fill calendar months equally, redistributing when sparse months
+    # (e.g. April's championships) exhaust their eligible games.
+    for _ in range(target):
+        candidates = [m for m in months if allocations[m] < capacities[m]]
+        m = min(candidates, key=lambda x: (allocations[x], x))
+        allocations[m] += 1
+    selections = []
+    for month in months:
+        group = temp.loc[temp['_month'].eq(month)].sort_values('_priority')
+        comp = group.loc[group.competitive]
+        other = group.loc[~group.competitive]
+        n = allocations[month]
+        n_comp = min(n // 2, len(comp))
+        n_other = min(n - n_comp, len(other))
+        remaining = n - n_comp - n_other
+        add_comp = min(remaining, len(comp) - n_comp)
+        n_comp += add_comp
+        remaining -= add_comp
+        n_other += min(remaining, len(other) - n_other)
+        picked = pd.concat([comp.head(n_comp), other.head(n_other)])
+        if len(picked) != n:
+            raise RuntimeError(f'Month quota not filled: {month}')
+        selections.append(picked)
+    selected = pd.concat(selections).sort_values(['_month','_priority'])
+    if len(selected) != target or selected['game_id'].duplicated().any():
+        raise RuntimeError('Historical sample validation failed')
+    return selected.drop(columns=['_month','_priority']).reset_index(drop=True)
+
+
 def export_results(outdir: Path, pool: pd.DataFrame, sample: pd.DataFrame,
                    fetched: list[dict]):
     outdir.mkdir(parents=True, exist_ok=True)
@@ -130,12 +185,26 @@ def export_results(outdir: Path, pool: pd.DataFrame, sample: pd.DataFrame,
     joined = sample.merge(retrieval[['game_id','status','espn_home_probability',
                                      'retrieved_at_utc','source_url']],
                            on='game_id',how='left',validate='one_to_one')
+    joined['game_month'] = pd.to_datetime(joined['game_date']).dt.strftime('%Y-%m')
     joined.to_csv(outdir/'all_games.csv',index=False)
+    monthly_coverage = joined.groupby('game_month', sort=True).agg(
+        requested=('game_id','size'),
+        competitive_requested=('competitive','sum'),
+        espn_found=('status',lambda x: int(x.eq('found').sum())),
+    ).reset_index()
+    monthly_coverage.to_csv(outdir/'monthly_coverage.csv',index=False)
     usable=joined.loc[joined.status.eq('found') & joined.espn_home_probability.notna()].copy()
     usable.to_csv(outdir/'same_game_comparison.csv',index=False)
     metrics, calibration=previous.evaluate(usable)
     metrics.to_csv(outdir/'model_metrics.csv',index=False)
     calibration.to_csv(outdir/'calibration.csv',index=False)
+    monthly_rows = []
+    for month, group in usable.groupby('game_month',sort=True):
+        for name, column in previous.MODEL_COLUMNS.items():
+            monthly_rows.append({'game_month':month,'model':name,
+                                 **previous.measure(group.home_win,group[column])})
+    pd.DataFrame(monthly_rows,columns=['game_month','model','n','correct',
+        'accuracy_pct','brier_score','log_loss']).to_csv(outdir/'monthly_model_metrics.csv',index=False)
     counts = {str(k):int(v) for k,v in retrieval.status.value_counts().items()}
     summary = {
         'purpose':'Historical ESPN Core predictor source feasibility, academic research only',
@@ -151,7 +220,9 @@ def export_results(outdir: Path, pool: pd.DataFrame, sample: pd.DataFrame,
         'espn_forecasts_found':int(len(usable)),
         'coverage_percent':round(100*len(usable)/len(sample),2) if len(sample) else 0.0,
         'status_counts':counts,
-        'sampling':'Deterministic, approximately 50:50 competitive and noncompetitive',
+        'sampling':'Deterministic approximately equal allocation by calendar month, then approximately 50:50 competitive/other within each month; NOT season representative',
+        'selected_by_month': {str(r.game_month):int(r.requested)
+                              for r in monthly_coverage.itertuples(index=False)},
         'warning':'Retrospectively retrieved values are NOT verified historical pregame predictions.'
     }
     (outdir/'core_audit_summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
@@ -160,6 +231,7 @@ def export_results(outdir: Path, pool: pd.DataFrame, sample: pd.DataFrame,
              '**ESPN predictor values retrieved now are not verified pretipoff snapshots.**', '',
              f'- Games checked: **{len(sample)}**',
              f'- Competitive games checked: **{int(sample.competitive.sum())}**',
+             f'- Months sampled: **{summary["selected_by_month"]}**',
              f'- Core predictor probabilities found: **{len(usable)}** ({summary["coverage_percent"]}%)',
              f'- Status counts: **{counts}**', '',
              '## Identical-game model comparison', '']
@@ -167,7 +239,8 @@ def export_results(outdir: Path, pool: pd.DataFrame, sample: pd.DataFrame,
         lines.append('No comparable forecasts were found. See core_endpoint_audit.csv; no accuracy claims are possible.')
     else:
         lines.append(metrics.to_markdown(index=False))
-        lines.extend(['', 'These are retrospectively retrieved ESPN values; no pretipoff accuracy claims.'])
+        lines.extend(['', 'These are retrospectively retrieved ESPN values; no pretipoff accuracy claims.',
+                      'See `monthly_model_metrics.csv` for the same-game comparison by month.'])
     (outdir/'README_RESULTS.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     return summary
 
@@ -179,14 +252,14 @@ def main(argv=None):
     parser.add_argument('--max-games',type=int,default=30)
     parser.add_argument('--pause-seconds',type=float,default=.5)
     args=parser.parse_args(argv)
-    if not 2<=args.max_games<=120:
-        parser.error('--max-games must be between 2 and 120')
+    if not 2<=args.max_games<=500:
+        parser.error('--max-games must be between 2 and 500')
     if not .3<=args.pause_seconds<=10:
         parser.error('--pause-seconds must be between 0.3 and 10 seconds')
     reference=pd.read_csv(args.reference,usecols=['game_id'],dtype={'game_id':str})
     identity=previous.fetch_identity_and_rating_gaps(reference.game_id.tolist())
     full=previous.load_eligible(Path(args.reference),identity)
-    sample=previous.sample_balanced(full,args.max_games)
+    sample=sample_across_months(full,args.max_games)
     client=requests.Session()
     client.headers.update({'User-Agent':'NCAA-MBB-academic-ESPN-core-audit/1.0',
                            'Accept':'application/json'})
