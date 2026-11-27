@@ -1,0 +1,55 @@
+name: NCAA MBB Forecast Archive Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install database driver
+        run: python -m pip install 'psycopg[binary]>=3.2,<4'
+      - name: Check forecast archive (read only)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import psycopg
+
+          database_url = os.environ.get('DATABASE_URL')
+          if not database_url:
+              raise SystemExit('Missing GitHub secret: DATABASE_URL')
+
+          with psycopg.connect(database_url, connect_timeout=20, sslmode='require') as conn:
+              with conn.cursor() as cursor:
+                  cursor.execute(
+                      "SELECT to_regclass('public.mbb_prospective_forecast_audit')"
+                  )
+                  if cursor.fetchone()[0] is None:
+                      raise SystemExit('Table public.mbb_prospective_forecast_audit not found')
+                  cursor.execute('SELECT COUNT(*) FROM public.mbb_prospective_forecast_audit')
+                  row_count = cursor.fetchone()[0]
+                  cursor.execute("""
+                      SELECT EXISTS (
+                          SELECT 1 FROM pg_trigger
+                          WHERE tgrelid = 'public.mbb_prospective_forecast_audit'::regclass
+                            AND tgname = 'protect_mbb_forecast_audit_trigger'
+                            AND tgenabled <> 'D'
+                      )
+                  """)
+                  protection_enabled = cursor.fetchone()[0]
+                  print(f'Connected to forecast archive: {row_count} existing rows')
+                  print(f'Archive protection trigger enabled: {protection_enabled}')
+                  if not protection_enabled:
+                      raise SystemExit('Protection trigger is missing or disabled')
+          PY
