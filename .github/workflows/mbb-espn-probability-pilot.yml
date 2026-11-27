@@ -1,0 +1,55 @@
+name: NCAA MBB ESPN Probability Research Pilot
+on:
+  workflow_dispatch:
+    inputs:
+      max_games:
+        description: 'Balanced historical sample (30-300 games; default 120)'
+        required: true
+        default: '120'
+        type: choice
+        options:
+          - '30'
+          - '60'
+          - '120'
+          - '200'
+          - '300'
+permissions:
+  contents: read
+jobs:
+  retrospective-espn-forecast-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify input files
+        run: |
+          test -f espn_probability_pilot.py
+          test -f reference/2026_model_reference.csv
+          test -f requirements_espn_probability.txt
+          test -f tests/test_espn_probability_pilot.py
+      - name: Install research dependencies
+        run: python -m pip install -r requirements_espn_probability.txt
+      - name: Run offline parser and metric tests
+        run: python -m unittest discover -s tests -p 'test_espn_probability_pilot.py' -v
+      - name: Run read-only ESPN feasibility pilot
+        run: |
+          python espn_probability_pilot.py \
+            --reference reference/2026_model_reference.csv \
+            --output-dir espn_probability_pilot_results \
+            --max-games "${{ inputs.max_games }}" \
+            --pause-seconds 0.6
+      - name: Upload audit and comparison results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-espn-probability-research-pilot
+          path: espn_probability_pilot_results/
+          if-no-files-found: warn
+          retention-days: 30
