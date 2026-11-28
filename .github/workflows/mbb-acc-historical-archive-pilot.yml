@@ -1,0 +1,38 @@
+name: NCAA MBB ACC Historical Archive Pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acc-historical-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify required files
+        run: |
+          test -f acc_historical_archive_pilot.py
+          test -f requirements_acc_archive.txt
+          test -f tests/test_acc_historical_archive_pilot.py
+      - name: Install browser dependencies
+        run: |
+          pip install -r requirements_acc_archive.txt
+          python -m playwright install --with-deps chromium
+      - name: Run offline parser tests
+        run: python -m unittest discover -s tests -p 'test_acc_historical_archive_pilot.py' -v
+      - name: Inspect official ACC archive (read only)
+        run: python acc_historical_archive_pilot.py --output acc_historical_archive_report
+      - name: Upload evidence for review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-acc-historical-archive-pilot
+          path: acc_historical_archive_report/
+          if-no-files-found: warn
