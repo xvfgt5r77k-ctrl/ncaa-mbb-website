@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   schedule:
     # The existing V2 feature refresh runs at 14:30 UTC.
-    - cron: '0 */3 * * *'
+    - cron: '3-59/10 * * * *'
 permissions:
   contents: read
 concurrency:
