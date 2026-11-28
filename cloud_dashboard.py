@@ -1,4 +1,4 @@
-"""Five-page NCAA D-I basketball schedule and prediction-analysis dashboard.
+"""Six-page NCAA D-I basketball schedule and prediction-analysis dashboard.
 
 Server-side access to existing winner-engine forecasts; displays saved model
 predictions only, never fabricates a prediction from team ratings.
@@ -396,6 +396,68 @@ def upcoming_page() -> None:
 
 
 
+
+def today_page() -> None:
+    """Every game on today's Central-Time calendar, including saved predictions.
+
+    Deliberately include completed/in-progress fixtures so that the day's saved
+    forecasts do not disappear once the game begins or finishes.
+    """
+    today = now_ct().date()
+    st.title("🏀 Today's Games")
+    st.caption(f"{today.strftime('%B %d, %Y')} · Central Time · saved pregame winner forecasts")
+    try:
+        games = fixtures(today, today, active_season())
+    except Exception as exc:
+        display_exception("today's games", exc)
+        return
+    if games.empty:
+        st.info("No games found for today. Check whether the schedule importer has loaded today's games.")
+        return
+    rows = []
+    for _, game in games.iterrows():
+        prediction = current_forecast(game)
+        finished = completed_legitimate(game)
+        if finished:
+            score = f"{int(game['away_score'])}–{int(game['home_score'])}"
+            pick = game.get("predicted_winner_team_id")
+            if prediction["Predicted winner"] == "Not yet predicted":
+                prediction_result = "No saved forecast"
+            else:
+                actual_id = str(game["home_id"] if float(game["home_score"]) > float(game["away_score"]) else game["away_id"])
+                prediction_result = "Correct" if str(pick) == actual_id else "Incorrect"
+        else:
+            score = "—"
+            prediction_result = "Pending" if prediction["Predicted winner"] != "Not yet predicted" else "Not predicted"
+        rows.append({
+            "Time (CT)": game_time_label(game["start_time_utc"]),
+            "Away": game["away_team"],
+            "Home": game["home_team"],
+            **prediction,
+            "Matchup type": matchup_type(game["home_net"], game["away_net"]),
+            "Game status": ("Final" if finished else str(game.get("status_detail") or "Scheduled")),
+            "Score (away–home)": score,
+            "Prediction result": prediction_result,
+        })
+    data = pd.DataFrame(rows)
+    total = len(data)
+    saved = int(data["Predicted winner"].ne("Not yet predicted").sum())
+    competitive = int(data["Matchup type"].eq("Competitive").sum())
+    a, b, c = st.columns(3)
+    a.metric("Today's games", total)
+    b.metric("Saved predictions", f"{saved}/{total}")
+    c.metric("Competitive matchups", competitive)
+    filt = st.selectbox("Today's matchup filter", ["All", "Competitive", "Noncompetitive", "Unrated"],
+                        key="today_matchup_filter")
+    if filt != "All":
+        data = data.loc[data["Matchup type"].eq(filt)]
+    st.dataframe(data, hide_index=True, use_container_width=True)
+    st.caption("Predicted winner and confidence come from your saved winner-v1.0 forecast in Supabase. "
+               "Games without a stored, valid pre-tipoff forecast show Not yet predicted. "
+               "Completed games are shown with their result; predictions aren't recalculated after tipoff. "
+               "Competitive means a team adjusted-net rating difference of 5 or less.")
+
+
 def tomorrow_page() -> None:
     """Dedicated tomorrow-only snapshot, using the same descriptors as Upcoming Matchups."""
     tomorrow = now_ct().date() + timedelta(days=1)
@@ -506,11 +568,12 @@ def accuracy_page() -> None:
                    "Other games remain outside the scored denominator; this is not full-schedule coverage.")
 
 
-# st.navigation overrides legacy pages/ menus: five pages, and no other pages.
+# st.navigation overrides legacy pages/ menus: six pages, and no other pages.
 # Available in Streamlit >= 1.36; keep existing Streamlit Cloud main-file target cloud_dashboard.py.
 selection=st.navigation([
     st.Page(schedule_page, title="Game Schedule", icon="📅", default=True),
     st.Page(yesterday_page, title="Yesterday's Results", icon="✅"),
+    st.Page(today_page, title="Today’s Games", icon="☀️"),
     st.Page(upcoming_page, title="Upcoming Matchups", icon="🏀"),
     st.Page(tomorrow_page, title="Tomorrow’s Games", icon="📆"),
     st.Page(accuracy_page, title="Confidence Accuracy", icon="📊"),
