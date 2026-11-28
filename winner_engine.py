@@ -97,7 +97,7 @@ def read_db(database_url: str, min_season: int, target_season: int) -> tuple[pd.
 
 
 def fresh_future_inputs(database_url: str, target_season: int, now: datetime,
-                        horizon_hours: float = 6.0) -> tuple[pd.DataFrame, dict]:
+                        horizon_hours: float = 48.0) -> tuple[pd.DataFrame, dict]:
     """Regenerate pregame inputs at execution time from current season's results.
 
     No database modification. Reuses the proven previous-day snapshot generator;
@@ -118,7 +118,7 @@ def fresh_future_inputs(database_url: str, target_season: int, now: datetime,
             continue
         eligible.append(g)
     if not eligible:
-        return pd.DataFrame(), {'d1_games_next_six_hours':0,'feature_generation':generation_audit}
+        return pd.DataFrame(), {'d1_games_in_forecast_window':0,'feature_generation':generation_audit}
     by_team={ (str(t['game_id']),str(t['team_id'])):t for t in team_rows if t['snapshot_kind']=='prospective'}
     cols=[]
     for game in eligible:
@@ -132,7 +132,7 @@ def fresh_future_inputs(database_url: str, target_season: int, now: datetime,
             for field in TEAM_FIELDS:
                 row[prefix+'_'+field]= now if field=='recorded_at' else t.get(field)
         cols.append(row)
-    return pd.DataFrame(cols), {'d1_games_next_six_hours':len(eligible),
+    return pd.DataFrame(cols), {'d1_games_in_forecast_window':len(eligible),
                                  'fresh_feature_pairs_generated':len(cols),
                                  'feature_generation':generation_audit}
 
@@ -383,10 +383,10 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
     now=datetime.now(timezone.utc)
     if input_csv:
         raw=pd.read_csv(input_csv,dtype={'game_id':str,'home_team_id':str,'away_team_id':str})
-        audit={'source':'offline_local_fixture', 'd1_games_next_six_hours':int((raw['completed']==0).sum())}
+        audit={'source':'offline_local_fixture', 'd1_games_in_forecast_window':int((raw['completed']==0).sum())}
     else:
         history_rows,audit=read_db(db_url,2022,target_season)
-        future_rows,now_audit=fresh_future_inputs(db_url,target_season,now,horizon_hours=6.0)
+        future_rows,now_audit=fresh_future_inputs(db_url,target_season,now,horizon_hours=48.0)
         audit.update(now_audit)
         raw=pd.concat([history_rows,future_rows],ignore_index=True) if len(future_rows) else history_rows
     if raw.empty:
@@ -419,7 +419,7 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
     if save and not future.empty:
         inserted=save_forecasts(db_url,future,now)
     scored_2026=next(r for r in test if r.get('group') is None)
-    available=int(audit.get('d1_games_next_six_hours',0))
+    available=int(audit.get('d1_games_in_forecast_window',0))
     audit.update({'research_version':RESEARCH_VERSION,
                   'goal_winner_accuracy_pct':90,
                   'target_achieved_on_2026_replay':scored_2026['accuracy_pct']>=90,
@@ -436,7 +436,7 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
                   'near_tipoff_coverage_pct':round(100*len(future)/available,2) if available else None,
                   'future_forecasts_inserted':inserted,
                   'prospective_source':'fresh read-only recomputation using db_upgrade_v2.generate',
-                  'predict_close_to_tipoff_window_hours':6,
+                  'predict_close_to_tipoff_window_hours':48,
                   'prospective_source_requires_recorded_before_tipoff':True,
                   'historical_replay_is_live_verified':False,
                   'all_competitive_and_noncompetitive_scored':True,
