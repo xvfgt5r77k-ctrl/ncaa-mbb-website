@@ -3,7 +3,7 @@ name: NCAA MBB Nightly ESPN Update
 on:
   schedule:
     # Every night at 3:37 AM Central, adjusted for daylight saving time.
-    - cron: '37 3 * * *'
+    - cron: '3-59/10 * * * *'
       timezone: 'America/Chicago'
   workflow_dispatch:
     inputs:
