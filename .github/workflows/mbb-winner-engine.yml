@@ -1,0 +1,50 @@
+name: NCAA MBB Winner-Only Predictor
+on:
+  workflow_dispatch:
+  schedule:
+    # The existing V2 feature refresh runs at 14:30 UTC.
+    - cron: '0 */3 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: mbb-winner-engine
+  cancel-in-progress: false
+jobs:
+  forecast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements_winner_engine.txt
+      - name: Ensure installed files exist
+        run: |
+          test -f winner_engine.py
+          test -f db_upgrade_v2.py
+          test -f grade_winners.py
+          test -f requirements_winner_engine.txt
+          test -f tests/test_winner_engine.py
+      - name: Install dependencies
+        run: python -m pip install -r requirements_winner_engine.txt
+      - name: Test model and time-cutoff safeguards
+        run: python -m unittest discover -s tests -p test_winner_engine.py -v
+      - name: Refit champion on prior seasons; forecast upcoming games
+        run: |
+          python winner_engine.py --target-season 2027 --save-prospective \
+            --output-dir winner_engine_results
+      - name: Grade saved pregame forecasts against completed results
+        if: success()
+        run: python grade_winners.py --output-dir winner_engine_results
+      - name: Upload metrics, audit and upcoming winner predictions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-winner-only-predictions
+          path: winner_engine_results/
+          if-no-files-found: warn
+          retention-days: 30
