@@ -1,4 +1,4 @@
-"""Four-page NCAA D-I basketball schedule and retrospective model evaluation dashboard.
+"""Four-page NCAA D-I basketball schedule, future matchups, and retrospective evaluation dashboard.
 
 This is the Streamlit entrypoint (replace the repository-root cloud_dashboard.py).
 Database credentials stay server-side. No live matchup-specific winning picks
@@ -189,9 +189,17 @@ def matchup_type(home_net, away_net) -> str:
     return "Competitive" if abs(float(h) - float(a)) <= 5 else "Noncompetitive"
 
 
-def rating_gap(home_net, away_net):
+def matchup_outlook(home_net, away_net) -> str:
+    """Neutral strength comparison, not a winner prediction or betting advice."""
     h, a = pd.to_numeric(pd.Series([home_net, away_net]), errors="coerce")
-    return round(abs(float(h) - float(a)), 1) if pd.notna(h) and pd.notna(a) else None
+    if pd.isna(h) or pd.isna(a):
+        return "Insufficient ratings"
+    gap = abs(float(h) - float(a))
+    if gap <= 5:
+        return "Evenly matched"
+    if gap <= 15:
+        return "Moderate rating separation"
+    return "Large rating separation"
 
 
 def confidence_band(probability: float) -> str:
@@ -319,36 +327,47 @@ def yesterday_page() -> None:
     st.dataframe(out, hide_index=True, use_container_width=True)
 
 
-def today_page() -> None:
-    st.title("📅 Today's Matchups")
-    st.caption("Current team-strength comparison only · Central Time")
-    st.info("This view shows every matchup and whether current ratings classify it as competitive. "
-            "It does not publish live winner picks or matchup-specific prediction confidence.")
+def upcoming_page() -> None:
+    st.title("🏀 Upcoming Matchups")
+    st.caption("Future NCAA Division I basketball games · Central Time · current team-strength outlook")
     today = now_ct().date()
+    horizon = st.selectbox("Upcoming window", [1, 3, 7, 14, 21], index=2,
+                           format_func=lambda n: f"Next {n} day{'s' if n != 1 else ''}")
+    end = today + timedelta(days=horizon-1)
     try:
-        games = fixtures(today, today, active_season())
+        games = fixtures(today, end, active_season())
     except Exception as exc:
-        display_exception("today's matchups", exc)
+        display_exception("upcoming matchups", exc)
         return
     if games.empty:
-        st.info("No games found today.")
+        st.info("No upcoming games found in that date range.")
         return
-    rows=[]
+    current = now_ct()
+    rows = []
     for _, g in games.iterrows():
-        rows.append({"Time (CT)": game_time_label(g["start_time_utc"]),
+        if is_completed(g["completed"]):
+            continue
+        tip = game_tipoff(g["start_time_utc"])
+        if tip is not None and tip <= current:
+            continue
+        rows.append({"Date (CT)": str(local_game_day(g)),
+                     "Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
+                     "Matchup outlook": matchup_outlook(g["home_net"], g["away_net"]),
                      "Matchup type": matchup_type(g["home_net"], g["away_net"]),
-                     "Rating gap": rating_gap(g["home_net"], g["away_net"]),
-                     "Game status": "Final" if is_completed(g["completed"]) else str(g.get("status_detail") or "Scheduled")})
-    out=pd.DataFrame(rows)
+                     "Game status": str(g.get("status_detail") or "Scheduled")})
+    if not rows:
+        st.info("No games remain before the end of this window.")
+        return
+    out = pd.DataFrame(rows)
     filt = st.selectbox("Matchup filter", ["All", "Competitive", "Noncompetitive", "Unrated"])
     if filt != "All":
         out = out[out["Matchup type"].eq(filt)]
-    st.metric("Listed games", len(out))
+    st.metric("Upcoming games", len(out))
     st.dataframe(out, hide_index=True, use_container_width=True)
-    st.caption("Competitive means |home adjusted net − away adjusted net| ≤ 5 points per 100 possessions. "
-               "Ratings are current descriptive values, not frozen pre-tipoff forecasts. "
-               "Games with unavailable ratings are marked Unrated.")
+    st.caption("'Competitive' means the current adjusted net ratings differ by 5 or fewer "
+               "points per 100 possessions. The outlook is a descriptive comparison, "
+               "not a predicted winner or a probability. Ratings can change before tipoff.")
 
 
 def load_historical() -> pd.DataFrame:
@@ -429,7 +448,7 @@ def accuracy_page() -> None:
 selection=st.navigation([
     st.Page(schedule_page, title="Game Schedule", icon="📅", default=True),
     st.Page(yesterday_page, title="Yesterday's Results", icon="✅"),
-    st.Page(today_page, title="Today's Matchups", icon="🏀"),
+    st.Page(upcoming_page, title="Upcoming Matchups", icon="🏀"),
     st.Page(accuracy_page, title="Confidence Accuracy", icon="📊"),
 ])
 selection.run()
