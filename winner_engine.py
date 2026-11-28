@@ -244,6 +244,67 @@ def describe_predictions(data: pd.DataFrame, proba: np.ndarray, model: str) -> d
             'log_loss':round(float(log_loss(actual,prob,labels=[0,1])),5)}
 
 
+CONFIDENCE_BANDS = ('50-59%', '60-69%', '70-79%', '80-89%', '90-100%')
+
+
+def winner_confidence_bands(home_win_probabilities) -> pd.Categorical:
+    """The probability assigned to the predicted winner, NOT always the home team.
+
+    Bins are [50,60), [60,70), [70,80), [80,90), [90,100].
+    """
+    p = np.asarray(home_win_probabilities, dtype=float)
+    if not np.isfinite(p).all() or not ((p >= 0) & (p <= 1)).all():
+        raise ValueError('Probability must be finite and in [0,1]')
+    confidence = np.maximum(p, 1-p)
+    return pd.cut(confidence, bins=[.5,.6,.7,.8,.9,1.0000000001],
+                  right=False,labels=CONFIDENCE_BANDS,include_lowest=True)
+
+
+def historical_game_level(test: pd.DataFrame, p_home: np.ndarray, model: str) -> pd.DataFrame:
+    if len(test) != len(p_home):
+        raise ValueError('Mismatch between games and probabilities')
+    pred_home = np.asarray(p_home, dtype=float) >= .5
+    actual_home = test.home_win.to_numpy(dtype=int) == 1
+    result = pd.DataFrame({
+        'game_id':test.game_id.to_numpy(), 'season':test.season.to_numpy(),
+        'game_date':test.game_date.to_numpy(),
+        'home_team_id':test.home_team_id.to_numpy(),
+        'away_team_id':test.away_team_id.to_numpy(),
+        'home_score':test.home_score.to_numpy(),
+        'away_score':test.away_score.to_numpy(),
+        'home_win_probability':np.asarray(p_home,dtype=float),
+        'predicted_winner_side':np.where(pred_home,'home','away'),
+        'predicted_winner_team_id':np.where(pred_home,test.home_team_id.to_numpy(),test.away_team_id.to_numpy()),
+        'actual_winner_side':np.where(actual_home,'home','away'),
+        'actual_winner_team_id':np.where(actual_home,test.home_team_id.to_numpy(),test.away_team_id.to_numpy()),
+        'confidence_pct':100*np.maximum(p_home,1-p_home),
+        'confidence_band':winner_confidence_bands(p_home).astype(str),
+        'correct':pred_home==actual_home,
+        'competitive_net_gap_le5':test.net_gap.abs().le(5).to_numpy(),
+        'model':model,
+        'evaluation_type':'historical_replay_not_live_verified',
+    })
+    return result
+
+
+def historical_confidence_records(games: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for group, subset in (
+        ('all',games),
+        ('competitive_net_gap_le5',games.loc[games.competitive_net_gap_le5]),
+        ('noncompetitive_net_gap_gt5',games.loc[~games.competitive_net_gap_le5]),
+    ):
+        for band in CONFIDENCE_BANDS:
+            d=subset.loc[subset.confidence_band.eq(band)]
+            n=len(d); wins=int(d.correct.sum()); losses=n-wins
+            rows.append({'group':group,'confidence_band':band,'games':n,
+                         'wins':wins,'losses':losses,
+                         'accuracy_pct':round(100*wins/n,3) if n else None,
+                         'average_confidence_pct':round(float(d.confidence_pct.mean()),3) if n else None,
+                         'evaluation_type':'historical_replay_not_live_verified'})
+    return pd.DataFrame(rows)
+
+
 def model_search(data: pd.DataFrame):
     tr=data.loc[data.season.isin([2022,2023,2024])]
     val=data.loc[data.season==2025]
@@ -277,7 +338,8 @@ def model_search(data: pd.DataFrame):
     champion_cols, champion = candidates()[chosen]
     champion.fit(data.loc[data.season.le(2026),champion_cols],
                  data.loc[data.season.le(2026),'home_win'].astype(int))
-    return chosen,champion_cols,champion,results,test_scores
+    game_level=historical_game_level(test,p_test,chosen)
+    return chosen,champion_cols,champion,results,test_scores,game_level
 
 
 def save_forecasts(database_url: str, p: pd.DataFrame, created: datetime) -> int:
@@ -331,7 +393,7 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
         raise ValueError('No historical games with V2 feature rows. Run the V2 historical refresh first.')
     df=make_features(raw)
     history=valid_history(df)
-    chosen,cols,champion,validation,test=model_search(history)
+    chosen,cols,champion,validation,test,game_level=model_search(history)
     future=valid_future(df,target_season,now=pd.Timestamp(now))
     if len(future):
         proba=champion.predict_proba(future[cols])[:,1]
@@ -350,6 +412,9 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
         future[display].to_csv(outdir/'next_game_winners.csv',index=False)
     validation.to_csv(outdir/'candidate_validation_2025.csv',index=False)
     pd.DataFrame(test).to_csv(outdir/'winner_accuracy_2026.csv',index=False)
+    game_level.to_csv(outdir/'winner_game_level_2026.csv',index=False)
+    confidence_summary=historical_confidence_records(game_level)
+    confidence_summary.to_csv(outdir/'confidence_records_2026.csv',index=False)
     inserted=0
     if save and not future.empty:
         inserted=save_forecasts(db_url,future,now)
@@ -361,6 +426,7 @@ def run(db_url: str, outdir: Path, target_season: int=2027, save: bool=False, in
                   'selected_by':'2025 historical winner accuracy; Brier tiebreak',
                   'validation_winner_accuracy_pct':validation.iloc[0]['accuracy_pct'],
                   'evaluation_2026':scored_2026,
+                  'confidence_report_2026':{'games':len(game_level),'bins':list(CONFIDENCE_BANDS),'method':'predicted winner probability'},
                   'evaluation_not_pristine':'2026 results were previously inspected in this project',
                   'historical_games_joined_feature_store':int(df.completed.sum()),
                   'history_games_used':len(history),
