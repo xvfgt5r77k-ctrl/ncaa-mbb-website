@@ -1,0 +1,16 @@
+group,confidence_band,games,wins,losses,accuracy_pct,average_confidence_pct,evaluation_type
+all,50-59%,1260,679,581,53.889,55.024,historical_replay_not_live_verified
+all,60-69%,1375,899,476,65.382,65.414,historical_replay_not_live_verified
+all,70-79%,1191,851,340,71.453,74.973,historical_replay_not_live_verified
+all,80-89%,1099,912,187,82.985,84.876,historical_replay_not_live_verified
+all,90-100%,709,679,30,95.769,93.934,historical_replay_not_live_verified
+competitive_net_gap_le5,50-59%,888,497,391,55.968,54.998,historical_replay_not_live_verified
+competitive_net_gap_le5,60-69%,929,604,325,65.016,65.57,historical_replay_not_live_verified
+competitive_net_gap_le5,70-79%,616,428,188,69.481,74.094,historical_replay_not_live_verified
+competitive_net_gap_le5,80-89%,45,37,8,82.222,81.415,historical_replay_not_live_verified
+competitive_net_gap_le5,90-100%,0,0,0,,,historical_replay_not_live_verified
+noncompetitive_net_gap_gt5,50-59%,372,182,190,48.925,55.086,historical_replay_not_live_verified
+noncompetitive_net_gap_gt5,60-69%,446,295,151,66.143,65.088,historical_replay_not_live_verified
+noncompetitive_net_gap_gt5,70-79%,575,423,152,73.565,75.915,historical_replay_not_live_verified
+noncompetitive_net_gap_gt5,80-89%,1054,875,179,83.017,85.024,historical_replay_not_live_verified
+noncompetitive_net_gap_gt5,90-100%,709,679,30,95.769,93.934,historical_replay_not_live_verified
