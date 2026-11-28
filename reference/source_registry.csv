@@ -1,0 +1,14 @@
+source_id,source_name,source_type,official_entry_url,verified_scope,coverage_note
+acc,Atlantic Coast Conference,official_conference,https://theacc.com/sports/2025/12/29/availability-reporting-mbb-archive.aspx,conference_games,Archive page identified; individual report availability varies
+sec,Southeastern Conference,official_conference,https://www.secsports.com/reports,conference_games,Official reporting program; check archived basketball entries
+big12,Big 12 Conference,official_conference,https://big12sports.com/sports/2026/1/1/MBBreporting.aspx,conference_games,Previous reports linked; conference games covered under policy
+bigeast,Big East Conference,official_conference,https://www.bigeast.com/sports/2025/11/26/2526_mbb_availability_reports.aspx,conference_games,Public basketball reporting began 2025-26
+mountain_west,Mountain West Conference,official_conference,https://themw.com/sports/2026/6/8/mbb-reports.aspx,conference_games,Availability reporting 2025-26 onward; verify per-game reports
+atlantic_10,Atlantic 10 Conference,official_conference,https://atlantic10.com/sports/2025/12/3/availability-reporting-mbb-current.aspx,conference_games,Published reporting page; individual archival completeness unverified
+american,American Conference,official_conference,https://theamerican.org/sports/2025/12/26/2025-26_mbb_pa.aspx,conference_games,Published 2025-26 men's basketball reports
+cusa,Conference USA,official_conference,https://admin.conferenceusa.com/sports/2025/12/16/MBB_1216251132.aspx,conference_games,Availability reporting covers conference basketball; nonconference exceptions
+ncaa_championship,NCAA DI Men's Basketball Championship,official_ncaa,https://www.ncaa.org/news/media-center-ncaa-releases-penalty-and-process-details-for-march-madness-player-availability-reports/,2026_championship_pilot,NCAA announced 2026 pilot; this is policy reference not a verified report archive
+bigten_example,Big Ten Conference,official_conference,https://bigten.org/api/media/file/36ebd96c-f2b2-4de6-aed9-d77282897764-MBB_20Availability_20Report_20-_20Week_2019_20B1G_20Tournament.pdf,2025_tournament_example,Verified example report only; do not infer full regular-season archive coverage
+school_athletics,School Athletics Department,school,,varies,School news releases or game notes need individual link and manual identity validation
+postgame_box_score,Completed Game Box Score,boxscore,https://www.espn.com/mens-college-basketball/scoreboard,postgame_only,Shows participation only after games; absence cannot be inferred from missing row
+secondary_reporting,Independent Published Reporting,secondary,,varies,Require named publication author date and original reference; lower confidence than official
