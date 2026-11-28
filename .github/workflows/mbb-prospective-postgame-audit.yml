@@ -1,0 +1,39 @@
+name: NCAA MBB Prospective Postgame Research Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '39 10 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  postgame-only-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check required paths
+        run: |
+          for path in mbb_postgame_snapshot_audit.py requirements_postgame_audit.txt tests/test_mbb_postgame_snapshot_audit.py; do
+            if [[ ! -f "$path" ]]; then echo "::error::Missing $path"; exit 1; fi
+          done
+      - name: Install dependencies
+        run: python -m pip install -r requirements_postgame_audit.txt
+      - name: Run offline tests
+        run: python -m unittest discover -s tests -p 'test_mbb_postgame_snapshot_audit.py' -v
+      - name: Evaluate previously saved ratings after final results
+        run: python mbb_postgame_snapshot_audit.py
+      - name: Upload completed-game report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-prospective-postgame-report
+          path: postgame_snapshot_audit/
+          if-no-files-found: warn
