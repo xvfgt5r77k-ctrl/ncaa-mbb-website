@@ -1,0 +1,29 @@
+name: NCAA MBB V3 Opponent Adjustment Research
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements_opponent_v3.txt
+      - name: Test chronology and rating calculations
+        run: python -m unittest discover -s tests -p 'test_opponent_adjustment_v3.py' -v
+      - name: Run read-only historical V3 comparison
+        run: python research_opponent_adjustment_v3.py --min-season 2022 --max-season 2026 --output-dir opponent_v3_report
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-v3-opponent-adjustment-research
+          path: opponent_v3_report/
+          if-no-files-found: warn
