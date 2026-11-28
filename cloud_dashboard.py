@@ -240,12 +240,13 @@ def safe_logo_url(value) -> str:
 def team_cell(name, team_id, logo, ap_ranks: dict[str, int], have_poll: bool) -> str:
     """Render AP rank, ESPN team logo, and name in one visual table cell."""
     rank = ap_ranks.get(str(team_id))
-    rank_label = f"#{rank}" if rank is not None else "NR" if have_poll else "—"
+    rank_markup = (f'<span class="mbb-rank">#{rank}</span>'
+                   if rank is not None else "")
     url = safe_logo_url(logo)
     artwork = (f'<img class="mbb-logo" loading="lazy" width="28" height="28" '
                f'src="{escape(url, quote=True)}" alt="">' if url else
                '<span class="mbb-no-logo" aria-hidden="true"></span>')
-    return (f'<span class="mbb-team"><span class="mbb-rank">{rank_label}</span>'
+    return (f'<span class="mbb-team">{rank_markup}'
             f'{artwork}<span class="mbb-team-name">{safe_text(name)}</span></span>')
 
 
@@ -306,9 +307,9 @@ def render_game_table(data: pd.DataFrame) -> None:
                 + '</tbody></table></div>', unsafe_allow_html=True)
     if ap_ranks:
         st.caption(f"Team labels show latest {poll_name or 'AP Top 25'} rank · ESPN logo · name. "
-                   "NR means unranked. Rankings are current, not necessarily from game day.")
+                   "Unranked teams display no number. Rankings are current, not necessarily from game day.")
     else:
-        st.caption("ESPN AP poll is temporarily unavailable; ranks display —. "
+        st.caption("ESPN AP poll is temporarily unavailable; team ranks are hidden. "
                    "Team logos are loaded from the existing database when available.")
 
 
