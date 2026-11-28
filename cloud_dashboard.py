@@ -731,7 +731,8 @@ def accuracy_page() -> None:
                    "Other games remain outside the scored denominator; this is not full-schedule coverage.")
 
 
-# st.navigation overrides legacy pages/ menus: six pages, and no other pages.
+# st.navigation overrides legacy pages/ menus. Keep the original six pages plus the dollar tracker.
+from dollar_tracker import dollar_tracker_page
 # Available in Streamlit >= 1.36; keep existing Streamlit Cloud main-file target cloud_dashboard.py.
 selection=st.navigation([
     st.Page(schedule_page, title="Game Schedule", icon="📅", default=True),
@@ -740,5 +741,6 @@ selection=st.navigation([
     st.Page(upcoming_page, title="Upcoming Matchups", icon="🏀"),
     st.Page(tomorrow_page, title="Tomorrow’s Games", icon="📆"),
     st.Page(accuracy_page, title="Confidence Accuracy", icon="📊"),
+    st.Page(dollar_tracker_page, title="Dollar Tracker", icon="💵"),
 ])
 selection.run()
