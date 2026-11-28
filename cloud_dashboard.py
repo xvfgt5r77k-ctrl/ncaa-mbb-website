@@ -1,4 +1,4 @@
-"""Four-page NCAA D-I basketball schedule, future matchups, and retrospective evaluation dashboard.
+"""Five-page NCAA D-I basketball schedule, future matchups, and retrospective evaluation dashboard.
 
 This is the Streamlit entrypoint (replace the repository-root cloud_dashboard.py).
 Database credentials stay server-side. No live matchup-specific winning picks
@@ -370,6 +370,44 @@ def upcoming_page() -> None:
                "not a predicted winner or a probability. Ratings can change before tipoff.")
 
 
+
+def tomorrow_page() -> None:
+    """Dedicated tomorrow-only snapshot, using the same descriptors as Upcoming Matchups."""
+    tomorrow = now_ct().date() + timedelta(days=1)
+    st.title("🏀 Tomorrow's Games")
+    st.caption(f"{tomorrow.strftime('%B %d, %Y')} · Central Time · NCAA Division I men's basketball")
+    try:
+        games = fixtures(tomorrow, tomorrow, active_season())
+    except Exception as exc:
+        display_exception("tomorrow's games", exc)
+        return
+    if games.empty:
+        st.info("No games found for tomorrow. Check whether the schedule importer has upcoming games.")
+        return
+    rows = []
+    for _, g in games.iterrows():
+        if is_completed(g["completed"]):
+            continue
+        rows.append({"Time (CT)": game_time_label(g["start_time_utc"]),
+                     "Away": g["away_team"], "Home": g["home_team"],
+                     "Matchup outlook": matchup_outlook(g["home_net"], g["away_net"]),
+                     "Matchup type": matchup_type(g["home_net"], g["away_net"]),
+                     "Game status": str(g.get("status_detail") or "Scheduled")})
+    if not rows:
+        st.info("There are no scheduled, unfinished games tomorrow.")
+        return
+    out = pd.DataFrame(rows)
+    filt = st.selectbox("Tomorrow's matchup filter", ["All", "Competitive", "Noncompetitive", "Unrated"],
+                        key="tomorrow_matchup_filter")
+    if filt != "All":
+        out = out.loc[out["Matchup type"].eq(filt)]
+    st.metric("Tomorrow's games", len(out))
+    st.dataframe(out, hide_index=True, use_container_width=True)
+    st.caption("Competitiveness uses current adjusted net ratings: a difference of 5 or fewer "
+               "points per 100 possessions is competitive. Outlook indicates relative team-strength "
+               "separation, not a future winner prediction; ratings may change before tipoff.")
+
+
 def load_historical() -> pd.DataFrame:
     if not HISTORY.is_file():
         return pd.DataFrame()
@@ -443,12 +481,13 @@ def accuracy_page() -> None:
                    "Other games remain outside the scored denominator; this is not full-schedule coverage.")
 
 
-# st.navigation overrides legacy pages/ menus: four pages, and no other pages.
+# st.navigation overrides legacy pages/ menus: five pages, and no other pages.
 # Available in Streamlit >= 1.36; keep existing Streamlit Cloud main-file target cloud_dashboard.py.
 selection=st.navigation([
     st.Page(schedule_page, title="Game Schedule", icon="📅", default=True),
     st.Page(yesterday_page, title="Yesterday's Results", icon="✅"),
     st.Page(upcoming_page, title="Upcoming Matchups", icon="🏀"),
+    st.Page(tomorrow_page, title="Tomorrow’s Games", icon="📆"),
     st.Page(accuracy_page, title="Confidence Accuracy", icon="📊"),
 ])
 selection.run()
