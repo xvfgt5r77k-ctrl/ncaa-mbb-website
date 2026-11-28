@@ -10,6 +10,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import os
 import logging
+from html import escape
+import requests
 
 import pandas as pd
 import streamlit as st
@@ -83,6 +85,7 @@ SELECT g.game_id::text AS game_id, g.season, g.game_date::text AS game_date,
        g.home_score, g.away_score, g.neutral_site,
        ht.team_id::text AS home_id, at.team_id::text AS away_id,
        ht.name AS home_team, at.name AS away_team,
+       ht.logo_url AS home_logo, at.logo_url AS away_logo,
        hr.adjusted_net AS home_net, ar.adjusted_net AS away_net,
        wf.predicted_winner_team_id, wf.home_win_probability,
        wf.created_at AS forecast_created_at, wf.model_version AS forecast_model
@@ -121,6 +124,7 @@ SELECT g.game_id::text AS game_id, g.season, g.game_date::text AS game_date,
        g.start_time_utc::text AS start_time_utc, g.completed,
        g.home_score, g.away_score, g.status_detail,
        ht.name AS home_team, at.name AS away_team,
+       ht.logo_url AS home_logo, at.logo_url AS away_logo,
        ht.team_id::text AS home_id, at.team_id::text AS away_id,
        f.predicted_winner_team_id, f.home_win_probability,
        f.created_at, f.tipoff_utc, f.model_version
@@ -153,6 +157,159 @@ WHERE f.model_version=%s AND g.season=%s AND g.completed=1
   AND f.created_at < f.tipoff_utc
 ORDER BY f.tipoff_utc,f.game_id
 """
+
+
+
+# The current AP Top 25 is retrieved once per hour, independently of game forecasts.
+# Team IDs are the ESPN IDs already stored in public.teams. We never infer ranks
+# from names or substitute a different poll when the AP feed is unavailable.
+def parse_ap_poll(payload: dict) -> tuple[dict[str, int], str]:
+    if not isinstance(payload, dict):
+        return {}, ""
+    for poll in payload.get("rankings", []):
+        if not isinstance(poll, dict):
+            continue
+        name = str(poll.get("shortName") or poll.get("name") or "")
+        lower = name.lower().strip()
+        if not (lower == "ap" or lower.startswith("ap ") or "associated press" in lower):
+            continue
+        ranks: dict[str, int] = {}
+        for entry in poll.get("ranks", []):
+            if not isinstance(entry, dict):
+                continue
+            team = entry.get("team") or {}
+            if not isinstance(team, dict):
+                continue
+            team_id = team.get("id")
+            try:
+                position = int(entry.get("current"))
+            except (TypeError, ValueError):
+                continue
+            if team_id is not None and 1 <= position <= 25:
+                ranks[str(team_id)] = position
+        if ranks:
+            return ranks, name
+    return {}, ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def current_ap_poll() -> tuple[dict[str, int], str]:
+    endpoint = ("https://site.api.espn.com/apis/site/v2/sports/"
+                "basketball/mens-college-basketball/rankings")
+    try:
+        response = requests.get(endpoint, timeout=9,
+                                headers={"Accept": "application/json",
+                                         "User-Agent": "NCAA-MBB-Dashboard/1.0"})
+        response.raise_for_status()
+        return parse_ap_poll(response.json())
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return {}, ""
+
+
+def safe_text(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        if pd.isna(value):
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    return escape(str(value))
+
+
+def team_metadata(game) -> dict:
+    """Carry stable IDs and logos for in-cell rendering, not as extra columns."""
+    home_id, away_id = str(game["home_id"]), str(game["away_id"])
+    selected = str(game.get("predicted_winner_team_id"))
+    selected = selected if selected in (home_id, away_id) else ""
+    actual = ""
+    if completed_legitimate(game):
+        actual = home_id if float(game["home_score"]) > float(game["away_score"]) else away_id
+    return {"_home_id": home_id, "_away_id": away_id,
+            "_home_logo": game.get("home_logo"),
+            "_away_logo": game.get("away_logo"),
+            "_predicted_winner_id": selected, "_past_prediction_id": selected,
+            "_actual_winner_id": actual}
+
+
+def safe_logo_url(value) -> str:
+    """Render only HTTPS logo URLs provided by the existing ESPN data importer."""
+    return str(value) if isinstance(value, str) and value.startswith("https://") else ""
+
+
+def team_cell(name, team_id, logo, ap_ranks: dict[str, int], have_poll: bool) -> str:
+    """Render AP rank, ESPN team logo, and name in one visual table cell."""
+    rank = ap_ranks.get(str(team_id))
+    rank_label = f"#{rank}" if rank is not None else "NR" if have_poll else "—"
+    url = safe_logo_url(logo)
+    artwork = (f'<img class="mbb-logo" loading="lazy" width="28" height="28" '
+               f'src="{escape(url, quote=True)}" alt="">' if url else
+               '<span class="mbb-no-logo" aria-hidden="true"></span>')
+    return (f'<span class="mbb-team"><span class="mbb-rank">{rank_label}</span>'
+            f'{artwork}<span class="mbb-team-name">{safe_text(name)}</span></span>')
+
+
+def render_game_table(data: pd.DataFrame) -> None:
+    """Render team logos/ranks in-place on all game tables, preserving columns.
+
+    Streamlit st.dataframe does not render mixed text+image in one cell, so use a
+    horizontally scrollable, escaped HTML table for schedule/result/game pages.
+    The confidence-summary tables (no teams) stay as ordinary dataframes.
+    """
+    if data.empty:
+        st.info("No games match the selected filter.")
+        return
+    ap_ranks, poll_name = current_ap_poll()
+    columns = [c for c in data.columns if not c.startswith("_")]
+    headers = "".join(f'<th scope="col">{safe_text(c)}</th>' for c in columns)
+    rows = []
+    for _, record in data.iterrows():
+        cells = []
+        for column in columns:
+            side = {
+                "Away": "away", "Home": "home", "Predicted winner": "predicted_winner",
+                "Past prediction": "past_prediction", "Actual winner": "actual_winner",
+            }.get(column)
+            team_id = record.get(f"_{side}_id", "") if side else ""
+            if team_id and side and pd.notna(record[column]):
+                if str(team_id) == str(record.get("_home_id")):
+                    logo = record.get("_home_logo")
+                elif str(team_id) == str(record.get("_away_id")):
+                    logo = record.get("_away_logo")
+                else:
+                    logo = ""
+                content = team_cell(record[column], team_id, logo, ap_ranks, bool(ap_ranks))
+            else:
+                content = safe_text(record[column])
+            cells.append(f"<td>{content}</td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    css = """
+    <style>
+      .mbb-scroll {width:100%;overflow-x:auto;border:1px solid #d4d7dc;border-radius:10px;
+                   margin:.5rem 0 1rem;}
+      .mbb-games {border-collapse:collapse;width:100%;font-size:.88rem;
+                  background:#fff;color:#151515;white-space:nowrap;}
+      .mbb-games th {background:#edf0f4;font-weight:700;text-align:left;padding:11px 12px;
+                     border-bottom:1px solid #c5cad2;}
+      .mbb-games td {padding:10px 12px;border-bottom:1px solid #e3e6eb;vertical-align:middle;}
+      .mbb-games tr:last-child td {border-bottom:0;}
+      .mbb-games tbody tr:hover {background:#f5f7fa;}
+      .mbb-team {display:inline-flex;align-items:center;gap:7px;min-width:145px;}
+      .mbb-rank {display:inline-block;min-width:31px;font-weight:750;color:#374151;}
+      .mbb-logo {width:28px;height:28px;object-fit:contain;flex:0 0 28px;}
+      .mbb-no-logo {display:inline-block;width:28px;flex:0 0 28px;}
+      .mbb-team-name {font-weight:600;}
+    </style>
+    """
+    st.markdown(css + '<div class="mbb-scroll"><table class="mbb-games"><thead><tr>'
+                + headers + '</tr></thead><tbody>' + "".join(rows)
+                + '</tbody></table></div>', unsafe_allow_html=True)
+    if ap_ranks:
+        st.caption(f"Team labels show latest {poll_name or 'AP Top 25'} rank · ESPN logo · name. "
+                   "NR means unranked. Rankings are current, not necessarily from game day.")
+    else:
+        st.caption("ESPN AP poll is temporarily unavailable; ranks display —. "
+                   "Team logos are loaded from the existing database when available.")
 
 
 def game_tipoff(value) -> datetime | None:
@@ -311,10 +468,11 @@ def schedule_page() -> None:
                  else "—")
         out.append({"Date (CT)": str(local_game_day(g)), "Time (CT)": game_time_label(g["start_time_utc"]),
                     "Away": g["away_team"], "Home": g["home_team"],
+                    **team_metadata(g),
                     "Status": "Final" if finished else str(g.get("status_detail") or "Scheduled"),
                     "Score (away–home)": score})
     st.metric("Games", len(out))
-    st.dataframe(pd.DataFrame(out), hide_index=True, use_container_width=True)
+    render_game_table(pd.DataFrame(out))
 
 
 def yesterday_page() -> None:
@@ -336,6 +494,7 @@ def yesterday_page() -> None:
                  if completed_legitimate(g) else "—")
         rows.append({"Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
+                     **team_metadata(g),
                      "Final (away–home)": score, **result})
     out = pd.DataFrame(rows)
     wins = int(out["Result"].eq("Correct").sum())
@@ -348,7 +507,7 @@ def yesterday_page() -> None:
     d.metric("No saved forecast", not_saved)
     if not_saved:
         st.caption("Games without a saved prediction are shown separately, not counted as wins or losses.")
-    st.dataframe(out, hide_index=True, use_container_width=True)
+    render_game_table(out)
 
 
 def upcoming_page() -> None:
@@ -377,6 +536,7 @@ def upcoming_page() -> None:
         rows.append({"Date (CT)": str(local_game_day(g)),
                      "Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
+                     **team_metadata(g),
                      **current_forecast(g),
                      "Matchup type": matchup_type(g["home_net"], g["away_net"]),
                      "Game status": str(g.get("status_detail") or "Scheduled")})
@@ -388,7 +548,7 @@ def upcoming_page() -> None:
     if filt != "All":
         out = out[out["Matchup type"].eq(filt)]
     st.metric("Upcoming games", len(out))
-    st.dataframe(out, hide_index=True, use_container_width=True)
+    render_game_table(out)
     st.caption("Predicted winner and confidence are taken from the stored winner-v1.0 forecast. "
                "Unpredicted games are explicitly labeled. Competitive means current adjusted net "
                "ratings differ by at most 5 points per 100 possessions. Historical confidence "
@@ -433,6 +593,7 @@ def today_page() -> None:
             "Time (CT)": game_time_label(game["start_time_utc"]),
             "Away": game["away_team"],
             "Home": game["home_team"],
+            **team_metadata(game),
             **prediction,
             "Matchup type": matchup_type(game["home_net"], game["away_net"]),
             "Game status": ("Final" if finished else str(game.get("status_detail") or "Scheduled")),
@@ -451,7 +612,7 @@ def today_page() -> None:
                         key="today_matchup_filter")
     if filt != "All":
         data = data.loc[data["Matchup type"].eq(filt)]
-    st.dataframe(data, hide_index=True, use_container_width=True)
+    render_game_table(data)
     st.caption("Predicted winner and confidence come from your saved winner-v1.0 forecast in Supabase. "
                "Games without a stored, valid pre-tipoff forecast show Not yet predicted. "
                "Completed games are shown with their result; predictions aren't recalculated after tipoff. "
@@ -477,6 +638,7 @@ def tomorrow_page() -> None:
             continue
         rows.append({"Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
+                     **team_metadata(g),
                      **current_forecast(g),
                      "Matchup type": matchup_type(g["home_net"], g["away_net"]),
                      "Game status": str(g.get("status_detail") or "Scheduled")})
@@ -489,7 +651,7 @@ def tomorrow_page() -> None:
     if filt != "All":
         out = out.loc[out["Matchup type"].eq(filt)]
     st.metric("Tomorrow's games", len(out))
-    st.dataframe(out, hide_index=True, use_container_width=True)
+    render_game_table(out)
     st.caption("Predicted winner and confidence reflect stored winner-v1.0 forecasts, not an "
                "automatically refreshed estimate. Missing forecasts appear as Not yet predicted. "
                "Competitive means the current adjusted net rating gap is at most 5.")
