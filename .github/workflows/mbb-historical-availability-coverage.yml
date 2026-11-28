@@ -1,0 +1,43 @@
+name: NCAA MBB Historical Availability Source Coverage
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: Completed ESPN season ID (e.g. 2026)
+        required: true
+        type: choice
+        options: ['2025', '2026', '2027']
+        default: '2026'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify files
+        shell: bash
+        run: |
+          test -f audit_historical_report_coverage.py
+          test -f requirements_historical_coverage.txt
+          test -f reference/source_registry.csv
+          test -f reference/historical_report_evidence.csv
+          test -f tests/test_historical_coverage.py
+      - name: Install dependencies
+        run: pip install -r requirements_historical_coverage.txt
+      - name: Test evidence handling
+        run: python -m unittest discover -s tests -p test_historical_coverage.py -v
+      - name: Audit completed-game source evidence
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python audit_historical_report_coverage.py --season '${{ inputs.season }}'
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncaa-mbb-historical-availability-source-coverage
+          path: historical_coverage_report/
+          if-no-files-found: ignore
