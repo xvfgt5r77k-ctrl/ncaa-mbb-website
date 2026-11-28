@@ -220,22 +220,30 @@ def dollar_tracker_page() -> None:
         st.session_state["dollar_tracker_unlocked"] = False
         st.rerun()
 
+    # Both entry modes accept signed amounts. Negative changes lower the running
+    # balance; an exact target may also be below zero.
     with st.form("dollar_tracker_new_change", clear_on_submit=False):
-        method = st.radio("Change type", ["Increase value", "Decrease value", "Set exact value"],
-                          horizontal=True)
+        method = st.radio(
+            "Edit mode", ["Add signed change", "Set exact value"], horizontal=True,
+            help="For a change, enter +25.00 to add $25 or -25.00 to subtract $25."
+        )
         if method == "Set exact value":
-            number = st.number_input("New value ($)", value=current_cents / 100,
-                                     step=1.0, format="%.2f")
+            number = st.number_input(
+                "New total ($) — negative values allowed",
+                value=current_cents / 100, step=1.0, format="%.2f"
+            )
         else:
-            number = st.number_input("Change amount ($)", min_value=0.01,
-                                     value=1.0, step=1.0, format="%.2f")
+            number = st.number_input(
+                "Change ($) — use + to add or - to subtract",
+                value=0.0, step=1.0, format="%.2f"
+            )
+            st.caption("Examples: -25.00 decreases the total by $25; 25.00 increases it by $25.")
         note = st.text_input("Description (optional)", max_chars=180)
         submitted = st.form_submit_button("Save value change", type="primary")
     if submitted:
         try:
             cents = dollar_cents(number)
-            delta = cents - current_cents if method == "Set exact value" else (
-                cents if method == "Increase value" else -cents)
+            delta = cents - current_cents if method == "Set exact value" else cents
             insert_entry(delta, note.strip())
         except ValueError as exc:
             st.error(str(exc))
