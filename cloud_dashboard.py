@@ -1,8 +1,7 @@
-"""Five-page NCAA D-I basketball schedule, future matchups, and retrospective evaluation dashboard.
+"""Five-page NCAA D-I basketball schedule and prediction-analysis dashboard.
 
-This is the Streamlit entrypoint (replace the repository-root cloud_dashboard.py).
-Database credentials stay server-side. No live matchup-specific winning picks
-or prediction probabilities are published here.
+Server-side access to existing winner-engine forecasts; displays saved model
+predictions only, never fabricates a prediction from team ratings.
 """
 from __future__ import annotations
 
@@ -84,7 +83,9 @@ SELECT g.game_id::text AS game_id, g.season, g.game_date::text AS game_date,
        g.home_score, g.away_score, g.neutral_site,
        ht.team_id::text AS home_id, at.team_id::text AS away_id,
        ht.name AS home_team, at.name AS away_team,
-       hr.adjusted_net AS home_net, ar.adjusted_net AS away_net
+       hr.adjusted_net AS home_net, ar.adjusted_net AS away_net,
+       wf.predicted_winner_team_id, wf.home_win_probability,
+       wf.created_at AS forecast_created_at, wf.model_version AS forecast_model
 FROM public.games g
 JOIN public.teams ht ON ht.team_id = g.home_team_id AND ht.is_d1=1
 JOIN public.teams at ON at.team_id = g.away_team_id AND at.is_d1=1
@@ -97,7 +98,19 @@ LEFT JOIN LATERAL (
     SELECT r.adjusted_net FROM public.team_adjusted_ratings r
     WHERE r.season=g.season AND r.team_id=g.away_team_id
     ORDER BY r.games_played DESC NULLS LAST LIMIT 1
-) ar ON TRUE
+ ) ar ON TRUE
+LEFT JOIN LATERAL (
+    SELECT p.predicted_winner_team_id, p.home_win_probability,
+           p.created_at, p.model_version
+    FROM public.mbb_winner_forecasts p
+    WHERE p.game_id = g.game_id::text
+      AND p.model_version = %s
+      AND p.home_team_id = g.home_team_id::text
+      AND p.away_team_id = g.away_team_id::text
+      AND p.created_at < p.tipoff_utc
+      AND p.tipoff_utc = NULLIF(BTRIM(g.start_time_utc::text), '')::timestamptz
+    ORDER BY p.created_at DESC LIMIT 1
+) wf ON TRUE
 WHERE g.season = %s AND g.game_date BETWEEN %s AND %s
 ORDER BY g.game_date, g.start_time_utc NULLS LAST, g.game_id
 """
@@ -189,17 +202,28 @@ def matchup_type(home_net, away_net) -> str:
     return "Competitive" if abs(float(h) - float(a)) <= 5 else "Noncompetitive"
 
 
-def matchup_outlook(home_net, away_net) -> str:
-    """Neutral strength comparison, not a winner prediction or betting advice."""
-    h, a = pd.to_numeric(pd.Series([home_net, away_net]), errors="coerce")
-    if pd.isna(h) or pd.isna(a):
-        return "Insufficient ratings"
-    gap = abs(float(h) - float(a))
-    if gap <= 5:
-        return "Evenly matched"
-    if gap <= 15:
-        return "Moderate rating separation"
-    return "Large rating separation"
+def current_forecast(row) -> dict:
+    """Display the engine's stored future-game forecast or explicit missing status.
+
+    A numeric probability does not turn into a prediction unless the saved team ID
+    is one of the fixture's participants and the probability is in [0, 1].
+    """
+    home_id, away_id = str(row["home_id"]), str(row["away_id"])
+    pick = row.get("predicted_winner_team_id")
+    raw_probability = row.get("home_win_probability")
+    try:
+        p = float(raw_probability)
+    except (ValueError, TypeError):
+        p = float('nan')
+    if str(pick) not in (home_id, away_id) or not (0 <= p <= 1):
+        return {"Predicted winner": "Not yet predicted", "Confidence": "—",
+                "Forecast saved (CT)": "—"}
+    selected_home = str(pick) == home_id
+    confidence = p if selected_home else 1-p
+    asof = game_tipoff(row.get("forecast_created_at"))
+    return {"Predicted winner": str(row["home_team"] if selected_home else row["away_team"]),
+            "Confidence": f"{confidence*100:.1f}%",
+            "Forecast saved (CT)": asof.strftime("%b %d, %I:%M %p") if asof else "—"}
 
 
 def confidence_band(probability: float) -> str:
@@ -248,7 +272,7 @@ def yesterday_result(row) -> dict:
 
 
 def fixtures(start: date, end: date, season: int) -> pd.DataFrame:
-    return only_local_days(run_query(SCHEDULE_SQL, (season,
+    return only_local_days(run_query(SCHEDULE_SQL, (FORECAST_MODEL, season,
         (start-timedelta(days=1)).isoformat(), (end+timedelta(days=1)).isoformat())), start, end)
 
 
@@ -329,7 +353,7 @@ def yesterday_page() -> None:
 
 def upcoming_page() -> None:
     st.title("🏀 Upcoming Matchups")
-    st.caption("Future NCAA Division I basketball games · Central Time · current team-strength outlook")
+    st.caption("Future NCAA Division I basketball games · Central Time · winner engine forecasts saved before tipoff")
     today = now_ct().date()
     horizon = st.selectbox("Upcoming window", [1, 3, 7, 14, 21], index=2,
                            format_func=lambda n: f"Next {n} day{'s' if n != 1 else ''}")
@@ -353,7 +377,7 @@ def upcoming_page() -> None:
         rows.append({"Date (CT)": str(local_game_day(g)),
                      "Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
-                     "Matchup outlook": matchup_outlook(g["home_net"], g["away_net"]),
+                     **current_forecast(g),
                      "Matchup type": matchup_type(g["home_net"], g["away_net"]),
                      "Game status": str(g.get("status_detail") or "Scheduled")})
     if not rows:
@@ -365,9 +389,10 @@ def upcoming_page() -> None:
         out = out[out["Matchup type"].eq(filt)]
     st.metric("Upcoming games", len(out))
     st.dataframe(out, hide_index=True, use_container_width=True)
-    st.caption("'Competitive' means the current adjusted net ratings differ by 5 or fewer "
-               "points per 100 possessions. The outlook is a descriptive comparison, "
-               "not a predicted winner or a probability. Ratings can change before tipoff.")
+    st.caption("Predicted winner and confidence are taken from the stored winner-v1.0 forecast. "
+               "Unpredicted games are explicitly labeled. Competitive means current adjusted net "
+               "ratings differ by at most 5 points per 100 possessions. Historical confidence "
+               "percentages are not guarantees; saved forecasts do not automatically refresh.")
 
 
 
@@ -390,7 +415,7 @@ def tomorrow_page() -> None:
             continue
         rows.append({"Time (CT)": game_time_label(g["start_time_utc"]),
                      "Away": g["away_team"], "Home": g["home_team"],
-                     "Matchup outlook": matchup_outlook(g["home_net"], g["away_net"]),
+                     **current_forecast(g),
                      "Matchup type": matchup_type(g["home_net"], g["away_net"]),
                      "Game status": str(g.get("status_detail") or "Scheduled")})
     if not rows:
@@ -403,9 +428,9 @@ def tomorrow_page() -> None:
         out = out.loc[out["Matchup type"].eq(filt)]
     st.metric("Tomorrow's games", len(out))
     st.dataframe(out, hide_index=True, use_container_width=True)
-    st.caption("Competitiveness uses current adjusted net ratings: a difference of 5 or fewer "
-               "points per 100 possessions is competitive. Outlook indicates relative team-strength "
-               "separation, not a future winner prediction; ratings may change before tipoff.")
+    st.caption("Predicted winner and confidence reflect stored winner-v1.0 forecasts, not an "
+               "automatically refreshed estimate. Missing forecasts appear as Not yet predicted. "
+               "Competitive means the current adjusted net rating gap is at most 5.")
 
 
 def load_historical() -> pd.DataFrame:
