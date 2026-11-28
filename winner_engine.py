@@ -85,7 +85,7 @@ def read_db(database_url: str, min_season: int, target_season: int) -> tuple[pd.
                     AND NOT (g.home_score=0 AND g.away_score=2)
                     AND NOT (g.home_score=2 AND g.away_score=0)) AS completed_d1_games,
                     COUNT(*) FILTER (WHERE g.completed=0 AND
-                    g.start_time_utc > now()+interval '10 minutes') AS future_d1_games
+                    NULLIF(BTRIM(g.start_time_utc), '')::timestamptz > now()+interval '10 minutes') AS future_d1_games
                 FROM public.games g
                 JOIN public.teams ht ON ht.team_id=g.home_team_id AND ht.is_d1=1
                 JOIN public.teams at ON at.team_id=g.away_team_id AND at.is_d1=1
@@ -294,9 +294,9 @@ def save_forecasts(database_url: str, p: pd.DataFrame, created: datetime) -> int
       SELECT %s,%s,%s,%s,%s,'v2.0',%s,%s,%s,%s,%s,now()
       WHERE EXISTS (
         SELECT 1 FROM public.games g WHERE g.game_id::text=%s
-          AND g.completed=0 AND g.start_time_utc > now() + interval '10 minutes'
+          AND g.completed=0 AND NULLIF(BTRIM(g.start_time_utc), '')::timestamptz > now() + interval '10 minutes'
           AND g.home_team_id::text=%s AND g.away_team_id::text=%s
-          AND g.start_time_utc=%s
+          AND NULLIF(BTRIM(g.start_time_utc), '')::timestamptz=%s::timestamptz
       )
       AND %s::timestamptz < %s::timestamptz - interval '10 minutes'
       AND %s::timestamptz < %s::timestamptz - interval '10 minutes'
